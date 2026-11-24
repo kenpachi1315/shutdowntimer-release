@@ -3,7 +3,7 @@
 Public update channel for the PisoNet Windows server.
 
 - Branch: `release/server`
-- Server build: `0.33`
+- Server build: `0.34`
 - Files are listed with SHA-256 checksums in `manifest.json`.
 
 ## OTA behavior
@@ -20,3 +20,5 @@ Build `0.31` changes Coin Rates to HH:MM:SS inputs while preserving the server A
 Build `0.32` replaces workstation bulk action emoji with consistent, accessible SVG icons in the admin dashboard.
 
 Build `0.33` reconciles the OTA page with the active server build, stops stale update polling, and reports same-version file differences clearly.
+
+Build `0.34` is a test build with no additional feature changes.
