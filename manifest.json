@@ -1,11 +1,11 @@
 {
   "product": "PisoNet Server",
-  "build": "0.19",
-  "previous_build": "0.18",
+  "build": "0.20",
+  "previous_build": "0.19",
   "release_branch": "release/server",
   "files": {
     "server.py": {
-      "sha256": "443ba6b051e23c2f8d4102cd41036ffc62e991dc6deb303b42f6ef513e15d43b",
+      "sha256": "4e67a303e0f88ee06ca8ddee0332f844fe437880fb2f571a5fb74a974025fabc",
       "destination": "server.py"
     },
     "coin_signal_engine.py": {
