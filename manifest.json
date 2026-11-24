@@ -1,11 +1,11 @@
 {
   "product": "PisoNet Server",
-  "build": "0.24",
-  "previous_build": "0.23",
+  "build": "0.25",
+  "previous_build": "0.24",
   "release_branch": "release/server",
   "files": {
     "server.py": {
-      "sha256": "8a61739a5007df7f533e34fb3b9adf9bed49c39e9a1eb23ba4332c4b9c0954e8",
+      "sha256": "f554a6d8cc15453b8519924e5f7c305927e3aa585e81e1d8de12dac96433cf40",
       "destination": "server.py"
     },
     "coin_signal_engine.py": {
@@ -21,7 +21,7 @@
       "destination": "server_update_worker.py"
     },
     "web/admin_v2.html": {
-      "sha256": "fd1a4c8e1880fc8be88ed0a0a54a99502fcdc68654594fcecfa31ba88dd476a6",
+      "sha256": "f2db2965b1923d971d6669a92b6067cf66926a36829b8cd87dd0286f88a26aaa",
       "destination": "web/admin_v2.html"
     }
   }
