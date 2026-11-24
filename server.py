@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PisoNet Milestone 1 prototype server. Python stdlib only; LAN prototype, not production hardened."""
 from __future__ import annotations
-import json, os, secrets, sqlite3, threading, time, uuid, hashlib, hmac, base64, mimetypes, socket, shutil, subprocess, sys
+import json, os, re, secrets, sqlite3, threading, time, uuid, hashlib, hmac, base64, mimetypes, socket, shutil, subprocess, sys
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.26'
+SERVER_BUILD = '0.29'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -24,6 +24,9 @@ SERVER_UPDATE_ALLOWED_FILES = {
 }
 SERVER_UPDATE_LOCK = threading.Lock()
 SERVER_UPDATE_STATUS_PATH = ROOT / 'server_update_status.json'
+
+def server_ota_download_root():
+    return Path('C:/TEMP/PisoNetServerOTA') if os.name=='nt' else Path('/tmp/PisoNetServerOTA')
 SERVER_UPDATE_STALE_AFTER_SECONDS = 180
 
 
@@ -172,6 +175,9 @@ def server_release_status(manifest):
     return {'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH,
             'current_build':SERVER_BUILD,'latest_build':remote_build,'update_available':available,
             'changed_files':changed,'checked_at':time.time(),
+            'platform':sys.platform,'python_version':sys.version.split()[0],
+            'download_directory':str(server_ota_download_root()),
+            'database_path':str(DB_PATH),
             'message':('Server update available.' if available else 'Server is up to date.')}
 
 
@@ -789,7 +795,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(502,{'error':'GITHUB_RELEASE_CHECK_FAILED','detail':str(exc)[:300],'current_build':SERVER_BUILD,'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH})
         if path=='/api/v2/server-update/status':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
-            return self.send_json(200,{'current_build':SERVER_BUILD,'last_install':read_server_update_status()})
+            download_dir=str(Path('C:/TEMP/PisoNetServerOTA') if os.name=='nt' else ROOT/'server_ota_staging')
+            return self.send_json(200,{'current_build':SERVER_BUILD,'last_install':read_server_update_status(),'platform':sys.platform,'python_version':sys.version.split()[0],'download_directory':download_dir,'database_path':str(DB_PATH)})
+        if path=='/api/v2/server-update/backups':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            backup_root=(ROOT/'backups').resolve();items=[]
+            if backup_root.is_dir():
+                for item in sorted(backup_root.glob('server-ota-*'),key=lambda p:p.stat().st_mtime,reverse=True):
+                    try:
+                        resolved=item.resolve()
+                        if not item.is_dir() or resolved.parent!=backup_root: continue
+                        saved=[rel for rel in SERVER_UPDATE_ALLOWED_FILES.values() if (item/rel).is_file()]
+                        if not saved: continue
+                        match=re.match(r'^server-ota-(.+?)-(\d{8}-\d{6})$',item.name)
+                        items.append({'name':item.name,'build':match.group(1) if match else 'unknown','created_at':item.stat().st_mtime,'files':saved,'can_rollback':'server.py' in saved})
+                    except OSError: continue
+            return self.send_json(200,{'backups':items})
         if path == '/' or path == '/admin':
             # V2 dashboard filename; fall back to the legacy filename for compatibility.
             admin_v2 = ROOT / 'web' / 'admin_v2.html'
@@ -1150,6 +1171,42 @@ class Handler(BaseHTTPRequestHandler):
                 status='attempting' if event=='insert_clicked' else 'failed'
                 write_coin_event(event,status,pc['id'],pc['name'],details=str(data.get('details','Client requested coin slot reservation'))[:300])
                 return self.send_json(202,{'logged':True})
+        if path=='/api/v2/server-update/rollback':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            backup_name=str(data.get('backup',''))
+            if not backup_name or Path(backup_name).name!=backup_name or not backup_name.startswith('server-ota-'):
+                return self.send_json(400,{'error':'INVALID_SERVER_BACKUP'})
+            backup=(ROOT/'backups'/backup_name).resolve();backup_root=(ROOT/'backups').resolve()
+            if backup.parent!=backup_root or not backup.is_dir(): return self.send_json(404,{'error':'SERVER_BACKUP_NOT_FOUND'})
+            if not (backup/'server.py').is_file(): return self.send_json(409,{'error':'BACKUP_CANNOT_RESTORE_SERVER_BUILD'})
+            old_server=(backup/'server.py').read_text(encoding='utf-8',errors='replace')
+            match=re.search(r"(?m)^SERVER_BUILD\s*=\s*['\"]([^'\"]+)['\"]",old_server)
+            if not match: return self.send_json(409,{'error':'BACKUP_BUILD_VERSION_MISSING'})
+            target_build=match.group(1)
+            try: server_build_tuple(target_build)
+            except ValueError: return self.send_json(409,{'error':'BACKUP_BUILD_VERSION_INVALID'})
+            if not SERVER_UPDATE_LOCK.acquire(blocking=False): return self.send_json(409,{'error':'SERVER_UPDATE_ALREADY_RUNNING'})
+            if server_update_status_is_active(read_server_update_status()):
+                SERVER_UPDATE_LOCK.release();return self.send_json(409,{'error':'SERVER_UPDATE_ALREADY_RUNNING'})
+            worker=ROOT/'server_update_worker.py'
+            state={'build':target_build,'state':'queued','message':'Manual rollback queued. The PisoNet server will restart.','updated_at':time.time(),'backup':str(backup)}
+            temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(state,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
+            flags=getattr(subprocess,'DETACHED_PROCESS',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)
+            if os.name=='nt': flags|=getattr(subprocess,'CREATE_NO_WINDOW',0)
+            worker_log=ROOT/'logs'/'server-update-worker.log';worker_log.parent.mkdir(parents=True,exist_ok=True)
+            try:
+                with worker_log.open('a',encoding='utf-8') as output:
+                    process=subprocess.Popen([sys.executable,str(worker),'--root',str(ROOT),'--stage',str(ROOT),'--build',target_build,'--previous-build',SERVER_BUILD,'--parent-pid',str(os.getpid()),'--rollback-backup',str(backup)],cwd=str(ROOT),stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,close_fds=True,creationflags=flags,start_new_session=(os.name!='nt'))
+                try:
+                    with connect() as audit_db: audit(audit_db,'admin','server_rollback_queued',{'build':target_build,'backup':backup_name,'worker_pid':process.pid})
+                except Exception as audit_error: print('Server rollback audit log failed after worker launch: '+str(audit_error))
+                return self.send_json(202,{'queued':True,'target_build':target_build,'message':'Manual rollback queued. Waiting for server restart.'})
+            except Exception as exc:
+                SERVER_UPDATE_LOCK.release()
+                state.update({'state':'failed','message':'Could not launch rollback worker: '+str(exc)[:300],'updated_at':time.time()})
+                temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp');temporary.write_text(json.dumps(state,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
+                return self.send_json(500,{'error':'SERVER_ROLLBACK_PREPARATION_FAILED','detail':str(exc)[:300]})
         if path=='/api/v2/server-update/install':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             if not SERVER_UPDATE_LOCK.acquire(blocking=False): return self.send_json(409,{'error':'SERVER_UPDATE_ALREADY_RUNNING'})
@@ -1161,9 +1218,11 @@ class Handler(BaseHTTPRequestHandler):
                 previous_status.update({'state':'stale','message':'Previous server update worker stopped reporting progress; retry is allowed.','updated_at':time.time()})
                 temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp')
                 temporary.write_text(json.dumps(previous_status,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
-            stage=ROOT/'server_ota_staging'/str(uuid.uuid4())
+            download_root=server_ota_download_root()
+            stage=download_root/str(uuid.uuid4())
             process=None
             try:
+                download_root.mkdir(parents=True,exist_ok=True)
                 manifest,_raw=fetch_server_release_manifest()
                 status=server_release_status(manifest)
                 if not status['update_available']:
@@ -1778,6 +1837,17 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json(404,{'error':'NOT_FOUND'})
     def do_DELETE(self):
         path=urlparse(self.path).path
+        if path.startswith('/api/v2/server-update/backups/'):
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            name=path.rsplit('/',1)[-1]
+            if not name.startswith('server-ota-') or Path(name).name!=name: return self.send_json(400,{'error':'INVALID_SERVER_BACKUP'})
+            backup_root=(ROOT/'backups').resolve();target=(backup_root/name).resolve()
+            if target.parent!=backup_root or not target.is_dir(): return self.send_json(404,{'error':'SERVER_BACKUP_NOT_FOUND'})
+            try:
+                shutil.rmtree(target)
+                with connect() as db: audit(db,'admin','server_backup_deleted',{'backup':name})
+                return self.send_json(200,{'ok':True,'deleted':name})
+            except OSError as exc: return self.send_json(500,{'error':'SERVER_BACKUP_DELETE_FAILED','detail':str(exc)[:200]})
         if path == '/api/settings/insert-sound':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             with LOCK, connect() as db:

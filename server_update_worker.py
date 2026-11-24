@@ -220,6 +220,7 @@ def main() -> int:
     parser.add_argument("--build", required=True)
     parser.add_argument("--previous-build", required=True)
     parser.add_argument("--parent-pid", required=True, type=int)
+    parser.add_argument("--rollback-backup", type=Path, default=None)
     args = parser.parse_args()
     root, stage = args.root.resolve(), args.stage.resolve()
     backup = root / "backups" / ("server-ota-" + re.sub(r"[^0-9A-Za-z_.-]", "_", args.build) + "-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -229,6 +230,29 @@ def main() -> int:
     service = service_installed()
     port = int(os.environ.get("PISONET_PORT", "3210"))
     try:
+        if args.rollback_backup is not None:
+            backup=args.rollback_backup.resolve()
+            if backup.parent!=(root/'backups').resolve() or not backup.is_dir():
+                raise ValueError('Rollback backup is outside the server backup directory')
+            changed=[Path(relative) for relative in ALLOWED_DESTINATIONS if (backup/relative).is_file()]
+            if Path('server.py') not in changed:
+                raise ValueError('Rollback backup does not contain server.py')
+            saved_server=(backup/'server.py').read_text(encoding='utf-8',errors='replace')
+            match=re.search(r"(?m)^SERVER_BUILD\s*=\s*['\"]([^'\"]+)['\"]",saved_server)
+            if not match or match.group(1)!=args.build:
+                raise ValueError('Rollback backup build does not match the requested target')
+            set_status(root,args.build,'stopping','Stopping PisoNet before manual rollback.',str(backup))
+            log(root,f'Manual rollback to build {args.build}: stopping service={service}; backup={backup}.')
+            stop_server(service,args.parent_pid);server_stopped=True
+            set_status(root,args.build,'installing','Restoring the selected server backup.',str(backup))
+            rollback(root,backup,changed)
+            active_pid=start_server(service,root) or args.parent_pid;server_stopped=False
+            healthy=wait_healthy(args.build,port,timeout=75)
+            state='complete' if healthy else 'failed'
+            message=(f'Manual rollback to build {args.build} completed and passed its health check.' if healthy else f'Manual rollback to build {args.build} was applied, but health check did not pass.')
+            set_status(root,args.build,state,message,str(backup))
+            log(root,f'Manual rollback to build {args.build}: health_check={healthy}.')
+            return 0 if healthy else 1
         manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
         if str(manifest.get("build")) != args.build:
             raise ValueError("Staged server manifest build does not match the requested build")
