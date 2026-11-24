@@ -3,7 +3,7 @@
 Public update channel for the PisoNet Windows server.
 
 - Branch: `release/server`
-- Server build: `0.31`
+- Server build: `0.32`
 - Files are listed with SHA-256 checksums in `manifest.json`.
 
 ## OTA behavior
@@ -16,3 +16,5 @@ Build `0.29` adds the dedicated Server OTA page, Windows `C:\TEMP\PisoNetServerO
 Build `0.30` adds a separate paginated Coin Insertion Logs page with search, status filters, CSV export, and full history from the daily coin event files. The dashboard Coin insertion activity View all link opens that page; Connection logs remain separate. The Server OTA page layout is also aligned with the page container.
 
 Build `0.31` changes Coin Rates to HH:MM:SS inputs while preserving the server API’s seconds-based storage.
+
+Build `0.32` replaces workstation bulk action emoji with consistent, accessible SVG icons in the admin dashboard.
