@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.29'
+SERVER_BUILD = '0.30'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -349,19 +349,23 @@ def write_coin_event(event, status, pc_id='', pc_name='', session_id='', transac
     return record
 
 
-def recent_coin_events(limit=20):
+def recent_coin_events(limit=20, offset=0):
+    """Read append-only daily coin logs newest-first for dashboard paging."""
     COIN_EVENT_DIR.mkdir(parents=True,exist_ok=True)
-    files=sorted(COIN_EVENT_DIR.glob('coin-events-*.txt'),reverse=True)[:3]
-    rows=[]
+    files=sorted(COIN_EVENT_DIR.glob('coin-events-*.txt'),reverse=True)
+    start=max(0,int(offset)); size=max(1,min(1000,int(limit)))
+    rows=[]; needed=start+size+1
     with COIN_EVENT_LOCK:
         for path in files:
-            try:
-                for line in path.read_text(encoding='utf-8').splitlines():
-                    try: rows.append(json.loads(line))
-                    except (ValueError,TypeError): continue
+            try: lines=path.read_text(encoding='utf-8').splitlines()
             except OSError: continue
-    rows.sort(key=lambda item:float(item.get('at',0)),reverse=True)
-    return rows[:max(1,min(100,int(limit)))]
+            for line in reversed(lines):
+                try: rows.append(json.loads(line))
+                except (ValueError,TypeError): continue
+                if len(rows)>=needed: break
+            if len(rows)>=needed: break
+    page=rows[start:start+size]
+    return {'events':page,'has_more':len(rows)>start+size,'offset':start,'limit':size}
 
 
 def session_view(row):
@@ -782,10 +786,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200,{'active':bool(state.get('active')),'approved':bool(state.get('approved')),'control_requested':bool(state.get('control_requested')),'control_enabled':bool(state.get('control_enabled') and state.get('control_expires_at',0)>now),'frame_base64':state.get('frame_base64',''),'frame_at':state.get('frame_at',0)})
         if path=='/api/v2/coin-events':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
-            limit=parse_qs(urlparse(self.path).query).get('limit',['20'])[0]
-            try: events=recent_coin_events(int(limit))
-            except ValueError: return self.send_json(400,{'error':'INVALID_LIMIT'})
-            return self.send_json(200,{'events':events})
+            query=parse_qs(urlparse(self.path).query)
+            limit=query.get('limit',['20'])[0];offset=query.get('offset',['0'])[0]
+            try: result=recent_coin_events(int(limit),int(offset))
+            except ValueError: return self.send_json(400,{'error':'INVALID_PAGINATION'})
+            return self.send_json(200,result)
         if path=='/api/v2/server-update':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             try:
