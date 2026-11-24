@@ -218,10 +218,11 @@ def main() -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--stage", required=True, type=Path)
     parser.add_argument("--build", required=True)
+    parser.add_argument("--previous-build", required=True)
     parser.add_argument("--parent-pid", required=True, type=int)
     args = parser.parse_args()
     root, stage = args.root.resolve(), args.stage.resolve()
-        backup = root / "backups" / ("server-ota-" + re.sub(r"[^0-9A-Za-z_.-]", "_", args.build) + "-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    backup = root / "backups" / ("server-ota-" + re.sub(r"[^0-9A-Za-z_.-]", "_", args.build) + "-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
     changed: list[Path] = []
     active_pid = args.parent_pid
     server_stopped = False
@@ -229,6 +230,8 @@ def main() -> int:
     port = int(os.environ.get("PISONET_PORT", "3210"))
     try:
         manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+        if str(manifest.get("build")) != args.build:
+            raise ValueError("Staged server manifest build does not match the requested build")
         operations = verify_payload(stage / "payload", manifest)
         set_status(root, args.build, "stopping", "Stopping the PisoNet server for the update.")
         log(root, f"Server OTA build {args.build}: stopping service={service}.")
@@ -250,7 +253,7 @@ def main() -> int:
         rollback(root, backup, changed)
         start_server(service, root)
         server_stopped = False
-        restored = wait_healthy(str(manifest.get("previous_build", "")), port, timeout=75) if manifest.get("previous_build") else False
+        restored = wait_healthy(args.previous_build, port, timeout=75)
         message = "Update failed; previous files restored."
         if not restored:
             message += " The service is restarting; check server logs."

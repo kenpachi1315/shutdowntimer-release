@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.18'
+SERVER_BUILD = '0.19'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -155,7 +155,10 @@ def server_release_status(manifest):
         local_path=ROOT/SERVER_UPDATE_ALLOWED_FILES[source]
         local_hash=hashlib.sha256(local_path.read_bytes()).hexdigest() if local_path.is_file() else ''
         if not hmac.compare_digest(local_hash.lower(),str(entry['sha256']).lower()): changed.append(source)
-    available=remote_tuple>current_tuple or bool(changed)
+    # A release is installable only when its declared build increases. This
+    # prevents a republished/same-version manifest from trapping the UI in an
+    # update loop when byte-level differences are present.
+    available=remote_tuple>current_tuple
     return {'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH,
             'current_build':SERVER_BUILD,'latest_build':remote_build,'update_available':available,
             'changed_files':changed,'checked_at':time.time(),
@@ -1161,7 +1164,7 @@ class Handler(BaseHTTPRequestHandler):
                 temporary.write_text(json.dumps(state,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
                 flags=getattr(subprocess,'DETACHED_PROCESS',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)
                 if os.name=='nt': flags|=getattr(subprocess,'CREATE_NO_WINDOW',0)
-                process=subprocess.Popen([sys.executable,str(worker),'--root',str(ROOT),'--stage',str(stage),'--build',str(manifest['build']),'--parent-pid',str(os.getpid())],cwd=str(ROOT),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,creationflags=flags,start_new_session=(os.name!='nt'))
+                process=subprocess.Popen([sys.executable,str(worker),'--root',str(ROOT),'--stage',str(stage),'--build',str(manifest['build']),'--previous-build',SERVER_BUILD,'--parent-pid',str(os.getpid())],cwd=str(ROOT),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,creationflags=flags,start_new_session=(os.name!='nt'))
                 audit(db,'admin','server_update_queued',{'build':manifest['build'],'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH,'files':status['changed_files'],'worker_pid':process.pid})
                 SERVER_UPDATE_LOCK.release()
                 return self.send_json(202,{'queued':True,'current_build':SERVER_BUILD,'target_build':manifest['build'],'files':status['changed_files'],'message':'Verified server update queued. The API will restart while the update is applied.'})
