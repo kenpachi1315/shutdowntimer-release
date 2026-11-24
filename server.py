@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.23'
+SERVER_BUILD = '0.24'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -135,7 +135,8 @@ def server_build_tuple(value):
 
 
 def fetch_server_release_manifest():
-    request=urllib.request.Request(SERVER_GITHUB_RAW+'/manifest.json',headers={'User-Agent':'PisoNet-Server-Updater/1','Accept':'application/json'})
+    cache_key=str(time.time_ns())
+    request=urllib.request.Request(SERVER_GITHUB_RAW+'/manifest.json?pisonet_nocache='+cache_key,headers={'User-Agent':'PisoNet-Server-Updater/1','Accept':'application/json','Cache-Control':'no-cache, no-store','Pragma':'no-cache'})
     with urllib.request.urlopen(request,timeout=20,context=github_ssl_context()) as response:
         raw=response.read(512*1024+1)
     if len(raw)>512*1024: raise ValueError('SERVER_RELEASE_MANIFEST_TOO_LARGE')
@@ -187,7 +188,8 @@ def download_server_release(stage: Path, manifest: dict):
     total=0
     for source,entry in manifest['files'].items():
         destination=SERVER_UPDATE_ALLOWED_FILES[source]
-        request=urllib.request.Request(SERVER_GITHUB_RAW+'/'+quote(source,safe='/'),headers={'User-Agent':'PisoNet-Server-Updater/1','Accept':'application/octet-stream'})
+        cache_key=str(time.time_ns())
+        request=urllib.request.Request(SERVER_GITHUB_RAW+'/'+quote(source,safe='/')+'?pisonet_nocache='+cache_key,headers={'User-Agent':'PisoNet-Server-Updater/1','Accept':'application/octet-stream','Cache-Control':'no-cache, no-store','Pragma':'no-cache'})
         with urllib.request.urlopen(request,timeout=30,context=github_ssl_context()) as response:
             content=response.read(8*1024*1024+1)
         if len(content)>8*1024*1024: raise ValueError('SERVER_RELEASE_FILE_TOO_LARGE: '+source)
