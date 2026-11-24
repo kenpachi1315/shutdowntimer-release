@@ -1,11 +1,13 @@
 # PisoNet Server Release
 
-Release channel for the PisoNet Windows server.
+Public update channel for the PisoNet Windows server.
 
 - Branch: `release/server`
-- Server build: `0.17`
-- Package contents: `server.py`, coin signal and serial adapter modules, `web/admin_v2.html`, and `manifest.json`.
+- Server build: `0.18`
+- Files are listed with SHA-256 checksums in `manifest.json`.
 
-`manifest.json` lists SHA-256 hashes for the payload files. The live database, environment configuration, service credentials, logs, and client installers are intentionally excluded.
+## OTA behavior
 
-An OTA updater should stage and verify this payload, preserve local configuration and the SQLite database, stop the server service before replacing files, then restart and roll back the payload if health verification fails.
+Admin → System settings → Server OTA checks this branch. Install downloads each manifest-listed file over HTTPS, verifies its SHA-256, stages a backup, stops the `PisoNetServer` service, replaces only the server Python modules and admin UI, then restarts the service. It checks `/api/health`; on a failed health check, it restores the previous files. The SQLite database, service configuration, logs, client installs, and Telegram settings are not part of the payload.
+
+Build `0.18` adds the OTA installer. A production server must first be manually updated to build `0.18`; later builds can be installed from the admin page.

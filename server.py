@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PisoNet Milestone 1 prototype server. Python stdlib only; LAN prototype, not production hardened."""
 from __future__ import annotations
-import json, os, secrets, sqlite3, threading, time, uuid, hashlib, hmac, base64, mimetypes, socket, shutil, subprocess
+import json, os, secrets, sqlite3, threading, time, uuid, hashlib, hmac, base64, mimetypes, socket, shutil, subprocess, sys
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,7 +11,19 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.17'
+SERVER_BUILD = '0.18'
+SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
+SERVER_GITHUB_BRANCH = 'release/server'
+SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
+SERVER_UPDATE_ALLOWED_FILES = {
+    'server.py':'server.py',
+    'coin_signal_engine.py':'coin_signal_engine.py',
+    'serial_coin_adapter.py':'serial_coin_adapter.py',
+    'server_update_worker.py':'server_update_worker.py',
+    'web/admin_v2.html':'web/admin_v2.html',
+}
+SERVER_UPDATE_LOCK = threading.Lock()
+SERVER_UPDATE_STATUS_PATH = ROOT / 'server_update_status.json'
 
 
 def resolve_timezone(name='Asia/Manila'):
@@ -86,6 +98,95 @@ def connect():
     db.execute('PRAGMA foreign_keys=ON')
     db.execute('PRAGMA journal_mode=WAL')
     return db
+
+
+def github_ssl_context():
+    """Use verified TLS with Windows trust stores, matching Telegram delivery."""
+    import ssl
+    if os.name == 'nt' and hasattr(ssl,'enum_certificates'):
+        context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_mode=ssl.CERT_REQUIRED;context.check_hostname=True
+        certs=[]
+        for store in ('ROOT','CA'):
+            for cert,encoding,_trust in ssl.enum_certificates(store):
+                if encoding=='x509_asn': certs.append(ssl.DER_cert_to_PEM_cert(cert))
+        if certs: context.load_verify_locations(cadata=''.join(certs))
+    else:
+        context=ssl.create_default_context()
+    ca_bundle=os.environ.get('PISONET_TLS_CA_BUNDLE','').strip()
+    if ca_bundle: context.load_verify_locations(cafile=ca_bundle)
+    return context
+
+
+def server_build_tuple(value):
+    import re
+    match=re.fullmatch(r'\d+(?:\.\d+){1,3}',str(value or ''))
+    if not match: raise ValueError('INVALID_SERVER_BUILD')
+    return tuple(int(part) for part in str(value).split('.'))
+
+
+def fetch_server_release_manifest():
+    request=urllib.request.Request(SERVER_GITHUB_RAW+'/manifest.json',headers={'User-Agent':'PisoNet-Server-Updater/1','Accept':'application/json'})
+    with urllib.request.urlopen(request,timeout=20,context=github_ssl_context()) as response:
+        raw=response.read(512*1024+1)
+    if len(raw)>512*1024: raise ValueError('SERVER_RELEASE_MANIFEST_TOO_LARGE')
+    manifest=json.loads(raw.decode('utf-8'))
+    build=str(manifest.get('build',''))
+    server_build_tuple(build)
+    entries=manifest.get('files')
+    if not isinstance(entries,dict): raise ValueError('SERVER_RELEASE_FILES_INVALID')
+    required=set(SERVER_UPDATE_ALLOWED_FILES)
+    if set(entries)!=required: raise ValueError('SERVER_RELEASE_FILE_SET_MISMATCH')
+    for source,entry in entries.items():
+        if not isinstance(entry,dict) or entry.get('destination')!=SERVER_UPDATE_ALLOWED_FILES[source]:
+            raise ValueError('SERVER_RELEASE_DESTINATION_INVALID')
+        digest=str(entry.get('sha256',''))
+        if len(digest)!=64 or any(c not in '0123456789abcdefABCDEF' for c in digest):
+            raise ValueError('SERVER_RELEASE_CHECKSUM_INVALID')
+    return manifest,raw
+
+
+def server_release_status(manifest):
+    remote_build=str(manifest['build'])
+    remote_tuple=server_build_tuple(remote_build)
+    current_tuple=server_build_tuple(SERVER_BUILD)
+    changed=[]
+    for source,entry in manifest['files'].items():
+        local_path=ROOT/SERVER_UPDATE_ALLOWED_FILES[source]
+        local_hash=hashlib.sha256(local_path.read_bytes()).hexdigest() if local_path.is_file() else ''
+        if not hmac.compare_digest(local_hash.lower(),str(entry['sha256']).lower()): changed.append(source)
+    available=remote_tuple>current_tuple or bool(changed)
+    return {'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH,
+            'current_build':SERVER_BUILD,'latest_build':remote_build,'update_available':available,
+            'changed_files':changed,'checked_at':time.time(),
+            'message':('Server update available.' if available else 'Server is up to date.')}
+
+
+def read_server_update_status():
+    try:
+        status=json.loads(SERVER_UPDATE_STATUS_PATH.read_text(encoding='utf-8'))
+        return status if isinstance(status,dict) else None
+    except (OSError,ValueError):
+        return None
+
+
+def download_server_release(stage: Path, manifest: dict):
+    payload=stage/'payload';payload.mkdir(parents=True,exist_ok=False)
+    total=0
+    for source,entry in manifest['files'].items():
+        destination=SERVER_UPDATE_ALLOWED_FILES[source]
+        request=urllib.request.Request(SERVER_GITHUB_RAW+'/'+quote(source,safe='/'),headers={'User-Agent':'PisoNet-Server-Updater/1','Accept':'application/octet-stream'})
+        with urllib.request.urlopen(request,timeout=30,context=github_ssl_context()) as response:
+            content=response.read(8*1024*1024+1)
+        if len(content)>8*1024*1024: raise ValueError('SERVER_RELEASE_FILE_TOO_LARGE: '+source)
+        total+=len(content)
+        if total>20*1024*1024: raise ValueError('SERVER_RELEASE_PACKAGE_TOO_LARGE')
+        digest=hashlib.sha256(content).hexdigest()
+        if not hmac.compare_digest(digest.lower(),str(entry['sha256']).lower()):
+            raise ValueError('SERVER_RELEASE_CHECKSUM_MISMATCH: '+source)
+        target=payload/destination;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(content)
+    (stage/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+    return payload
 
 
 def init_db():
@@ -665,6 +766,16 @@ class Handler(BaseHTTPRequestHandler):
             try: events=recent_coin_events(int(limit))
             except ValueError: return self.send_json(400,{'error':'INVALID_LIMIT'})
             return self.send_json(200,{'events':events})
+        if path=='/api/v2/server-update':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            try:
+                manifest,_raw=fetch_server_release_manifest()
+                return self.send_json(200,{**server_release_status(manifest),'last_install':read_server_update_status()})
+            except Exception as exc:
+                return self.send_json(502,{'error':'GITHUB_RELEASE_CHECK_FAILED','detail':str(exc)[:300],'current_build':SERVER_BUILD,'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH})
+        if path=='/api/v2/server-update/status':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            return self.send_json(200,{'current_build':SERVER_BUILD,'last_install':read_server_update_status()})
         if path == '/' or path == '/admin':
             # V2 dashboard filename; fall back to the legacy filename for compatibility.
             admin_v2 = ROOT / 'web' / 'admin_v2.html'
@@ -1025,6 +1136,40 @@ class Handler(BaseHTTPRequestHandler):
                 status='attempting' if event=='insert_clicked' else 'failed'
                 write_coin_event(event,status,pc['id'],pc['name'],details=str(data.get('details','Client requested coin slot reservation'))[:300])
                 return self.send_json(202,{'logged':True})
+        if path=='/api/v2/server-update/install':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            if not SERVER_UPDATE_LOCK.acquire(blocking=False): return self.send_json(409,{'error':'SERVER_UPDATE_ALREADY_RUNNING'})
+            previous_status=read_server_update_status() or {}
+            if previous_status.get('state') in ('queued','stopping','installing','rollback'):
+                SERVER_UPDATE_LOCK.release()
+                return self.send_json(409,{'error':'SERVER_UPDATE_ALREADY_RUNNING','status':previous_status})
+            stage=ROOT/'server_ota_staging'/str(uuid.uuid4())
+            try:
+                manifest,_raw=fetch_server_release_manifest()
+                status=server_release_status(manifest)
+                if not status['update_available']:
+                    SERVER_UPDATE_LOCK.release()
+                    return self.send_json(409,{'error':'SERVER_ALREADY_UP_TO_DATE','current_build':SERVER_BUILD,'latest_build':manifest['build']})
+                if server_build_tuple(manifest['build'])<=server_build_tuple(SERVER_BUILD):
+                    SERVER_UPDATE_LOCK.release()
+                    return self.send_json(409,{'error':'SERVER_RELEASE_BUILD_MUST_INCREASE','current_build':SERVER_BUILD,'latest_build':manifest['build']})
+                download_server_release(stage,manifest)
+                worker=stage/'payload'/'server_update_worker.py'
+                if not worker.is_file(): raise ValueError('SERVER_UPDATE_WORKER_MISSING')
+                state={'build':manifest['build'],'state':'queued','message':'Verified update queued; server will restart.','updated_at':time.time(),'backup':''}
+                temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp')
+                temporary.write_text(json.dumps(state,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
+                flags=getattr(subprocess,'DETACHED_PROCESS',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)
+                if os.name=='nt': flags|=getattr(subprocess,'CREATE_NO_WINDOW',0)
+                process=subprocess.Popen([sys.executable,str(worker),'--root',str(ROOT),'--stage',str(stage),'--build',str(manifest['build']),'--parent-pid',str(os.getpid())],cwd=str(ROOT),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,creationflags=flags,start_new_session=(os.name!='nt'))
+                audit(db,'admin','server_update_queued',{'build':manifest['build'],'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH,'files':status['changed_files'],'worker_pid':process.pid})
+                SERVER_UPDATE_LOCK.release()
+                return self.send_json(202,{'queued':True,'current_build':SERVER_BUILD,'target_build':manifest['build'],'files':status['changed_files'],'message':'Verified server update queued. The API will restart while the update is applied.'})
+            except Exception as exc:
+                try: shutil.rmtree(stage,ignore_errors=True)
+                except Exception: pass
+                if SERVER_UPDATE_LOCK.locked(): SERVER_UPDATE_LOCK.release()
+                return self.send_json(502,{'error':'SERVER_UPDATE_PREPARATION_FAILED','detail':str(exc)[:300]})
         if path == '/api/settings/insert-sound':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             filename=os.path.basename(str(data.get('filename','insert-sound')))
