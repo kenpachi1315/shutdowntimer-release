@@ -17,7 +17,7 @@
       "destination": "serial_coin_adapter.py"
     },
     "server_update_worker.py": {
-      "sha256": "f82a2be40f0503ff8e6c9caf50131457955b9b29aeb83676a3e2c6a999442942",
+      "sha256": "50a63a606d83dd371e11c48c93aa4bb27e11be9d086d6859304ca4c3d0b0abf3",
       "destination": "server_update_worker.py"
     },
     "web/admin_v2.html": {

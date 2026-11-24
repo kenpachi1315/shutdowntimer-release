@@ -101,6 +101,33 @@ def wait_service_state(expected: int, timeout: int = 40) -> bool:
     return False
 
 
+def process_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # Access denied means the process exists.
+        try:
+            code = wintypes.DWORD()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
 def stop_server(service: bool, parent_pid: int) -> None:
     if service:
         result = subprocess.run(["sc.exe", "stop", "PisoNetServer"], capture_output=True, text=True, timeout=20)
@@ -115,12 +142,7 @@ def stop_server(service: bool, parent_pid: int) -> None:
         pass
     deadline = time.time() + 30
     while time.time() < deadline:
-        try:
-            os.kill(parent_pid, 0)
-        except ProcessLookupError:
-            return
-        except OSError:
-            return
+        if not process_is_alive(parent_pid): return
         time.sleep(0.25)
     raise RuntimeError("Server process did not stop in time")
 
