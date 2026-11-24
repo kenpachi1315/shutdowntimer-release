@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.21'
+SERVER_BUILD = '0.22'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -1189,11 +1189,9 @@ class Handler(BaseHTTPRequestHandler):
                 if process is None:
                     try: shutil.rmtree(stage,ignore_errors=True)
                     except Exception: pass
-                    queued=read_server_update_status() or {}
-                    if queued.get('state')=='queued' and str(queued.get('build'))==str(manifest.get('build') if 'manifest' in locals() else ''):
-                        queued.update({'state':'failed','message':'Could not launch server update worker: '+str(exc)[:300],'updated_at':time.time()})
-                        temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp')
-                        temporary.write_text(json.dumps(queued,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
+                    failed={'build':str(manifest.get('build','unknown')) if 'manifest' in locals() else 'unknown','state':'failed','message':'Server update preparation failed: '+str(exc)[:300],'updated_at':time.time(),'backup':''}
+                    temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp')
+                    temporary.write_text(json.dumps(failed,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
                 if SERVER_UPDATE_LOCK.locked(): SERVER_UPDATE_LOCK.release()
                 return self.send_json(502,{'error':'SERVER_UPDATE_PREPARATION_FAILED','detail':str(exc)[:300]})
         if path == '/api/settings/insert-sound':
