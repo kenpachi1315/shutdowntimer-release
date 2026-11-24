@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.20'
+SERVER_BUILD = '0.21'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -24,6 +24,15 @@ SERVER_UPDATE_ALLOWED_FILES = {
 }
 SERVER_UPDATE_LOCK = threading.Lock()
 SERVER_UPDATE_STATUS_PATH = ROOT / 'server_update_status.json'
+SERVER_UPDATE_STALE_AFTER_SECONDS = 180
+
+
+def server_update_status_is_active(status):
+    if not isinstance(status,dict) or status.get('state') not in ('queued','starting','stopping','installing','rollback'):
+        return False
+    try: updated=float(status.get('updated_at',0))
+    except (TypeError,ValueError): updated=0
+    return updated>0 and time.time()-updated < SERVER_UPDATE_STALE_AFTER_SECONDS
 
 
 def resolve_timezone(name='Asia/Manila'):
@@ -1143,10 +1152,15 @@ class Handler(BaseHTTPRequestHandler):
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             if not SERVER_UPDATE_LOCK.acquire(blocking=False): return self.send_json(409,{'error':'SERVER_UPDATE_ALREADY_RUNNING'})
             previous_status=read_server_update_status() or {}
-            if previous_status.get('state') in ('queued','stopping','installing','rollback'):
+            if server_update_status_is_active(previous_status):
                 SERVER_UPDATE_LOCK.release()
                 return self.send_json(409,{'error':'SERVER_UPDATE_ALREADY_RUNNING','status':previous_status})
+            if previous_status.get('state') in ('queued','starting','stopping','installing','rollback'):
+                previous_status.update({'state':'stale','message':'Previous server update worker stopped reporting progress; retry is allowed.','updated_at':time.time()})
+                temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp')
+                temporary.write_text(json.dumps(previous_status,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
             stage=ROOT/'server_ota_staging'/str(uuid.uuid4())
+            process=None
             try:
                 manifest,_raw=fetch_server_release_manifest()
                 status=server_release_status(manifest)
@@ -1164,13 +1178,22 @@ class Handler(BaseHTTPRequestHandler):
                 temporary.write_text(json.dumps(state,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
                 flags=getattr(subprocess,'DETACHED_PROCESS',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)
                 if os.name=='nt': flags|=getattr(subprocess,'CREATE_NO_WINDOW',0)
-                process=subprocess.Popen([sys.executable,str(worker),'--root',str(ROOT),'--stage',str(stage),'--build',str(manifest['build']),'--previous-build',SERVER_BUILD,'--parent-pid',str(os.getpid())],cwd=str(ROOT),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,creationflags=flags,start_new_session=(os.name!='nt'))
-                audit(db,'admin','server_update_queued',{'build':manifest['build'],'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH,'files':status['changed_files'],'worker_pid':process.pid})
+                worker_log=ROOT/'logs'/'server-update-worker.log';worker_log.parent.mkdir(parents=True,exist_ok=True)
+                with worker_log.open('a',encoding='utf-8') as output:
+                    process=subprocess.Popen([sys.executable,str(worker),'--root',str(ROOT),'--stage',str(stage),'--build',str(manifest['build']),'--previous-build',SERVER_BUILD,'--parent-pid',str(os.getpid())],cwd=str(ROOT),stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,close_fds=True,creationflags=flags,start_new_session=(os.name!='nt'))
+                try: audit(db,'admin','server_update_queued',{'build':manifest['build'],'repository':SERVER_GITHUB_REPOSITORY,'branch':SERVER_GITHUB_BRANCH,'files':status['changed_files'],'worker_pid':process.pid})
+                except Exception as audit_error: print('Server OTA audit log failed after worker launch: '+str(audit_error))
                 SERVER_UPDATE_LOCK.release()
                 return self.send_json(202,{'queued':True,'current_build':SERVER_BUILD,'target_build':manifest['build'],'files':status['changed_files'],'message':'Verified server update queued. The API will restart while the update is applied.'})
             except Exception as exc:
-                try: shutil.rmtree(stage,ignore_errors=True)
-                except Exception: pass
+                if process is None:
+                    try: shutil.rmtree(stage,ignore_errors=True)
+                    except Exception: pass
+                    queued=read_server_update_status() or {}
+                    if queued.get('state')=='queued' and str(queued.get('build'))==str(manifest.get('build') if 'manifest' in locals() else ''):
+                        queued.update({'state':'failed','message':'Could not launch server update worker: '+str(exc)[:300],'updated_at':time.time()})
+                        temporary=SERVER_UPDATE_STATUS_PATH.with_suffix('.json.tmp')
+                        temporary.write_text(json.dumps(queued,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');os.replace(temporary,SERVER_UPDATE_STATUS_PATH)
                 if SERVER_UPDATE_LOCK.locked(): SERVER_UPDATE_LOCK.release()
                 return self.send_json(502,{'error':'SERVER_UPDATE_PREPARATION_FAILED','detail':str(exc)[:300]})
         if path == '/api/settings/insert-sound':
