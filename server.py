@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.34'
+SERVER_BUILD = '0.47'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -28,6 +28,26 @@ SERVER_UPDATE_STATUS_PATH = ROOT / 'server_update_status.json'
 def server_ota_download_root():
     return Path('C:/TEMP/PisoNetServerOTA') if os.name=='nt' else Path('/tmp/PisoNetServerOTA')
 SERVER_UPDATE_STALE_AFTER_SECONDS = 180
+
+FTECH_MEMBER_COLUMNS = (
+    'member_id','active_pc_ip','active_pc_name','name','username','password',
+    'remaining_time','vip_rem_time','vvip_rem_time','points','vip_points',
+    'vvip_points','credit','session_id','login_status','login_pctier','status',
+    'date_inserted','last_update','nonvip_attempt','vip_attempt','vvip_attempt',
+    'nonvip_last_login','vip_last_login','vvip_last_login',
+    'nonvip_activetime_snapshot','vip_activetime_snapshot',
+    'vvip_activetime_snapshot','pctier','branchid','last_spin','referred_by',
+)
+
+def default_game_settings():
+    return {
+        'spin': {'enabled':True,'difficulty':'easy','prizes':[{'minutes':1,'win_percent':30},{'minutes':2,'win_percent':25},{'minutes':5,'win_percent':12},{'minutes':10,'win_percent':3}]},
+        'mystery': {'enabled':True,'difficulty':'easy','prizes':[{'minutes':1,'win_percent':25},{'minutes':3,'win_percent':18},{'minutes':5,'win_percent':10},{'minutes':10,'win_percent':2}]},
+        'scratch': {'enabled':True,'difficulty':'easy','prizes':[{'minutes':1,'win_percent':30},{'minutes':3,'win_percent':18},{'minutes':5,'win_percent':8}]},
+        'streak': {'enabled':False,'difficulty':'easy','prizes':[{'minutes':1,'win_percent':25},{'minutes':2,'win_percent':20},{'minutes':3,'win_percent':15},{'minutes':5,'win_percent':10},{'minutes':10,'win_percent':5}]},
+        'progress': {'enabled':False,'difficulty':'easy','prizes':[{'minutes':1,'win_percent':20},{'minutes':3,'win_percent':15},{'minutes':5,'win_percent':10},{'minutes':10,'win_percent':5}]},
+        'battle': {'enabled':False,'difficulty':'easy','prizes':[{'minutes':5,'win_percent':10},{'minutes':10,'win_percent':5},{'minutes':20,'win_percent':1}]},
+    }
 
 
 def server_update_status_is_active(status):
@@ -213,21 +233,28 @@ def init_db():
     with connect() as db:
         db.executescript('''
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS pcs(id TEXT PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, last_seen REAL, online INTEGER NOT NULL DEFAULT 0, device_uuid TEXT, archived INTEGER NOT NULL DEFAULT 0, admin_locked INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS rate_rules(denomination_centavos INTEGER PRIMARY KEY, seconds INTEGER NOT NULL CHECK(seconds >= 0));
-        CREATE TABLE IF NOT EXISTS coin_sessions(id TEXT PRIMARY KEY, pc_id TEXT NOT NULL REFERENCES pcs(id), status TEXT NOT NULL, amount_centavos INTEGER NOT NULL DEFAULT 0, started_at REAL NOT NULL, last_coin_at REAL, finalized_at REAL, transaction_id TEXT UNIQUE, error TEXT);
+        CREATE TABLE IF NOT EXISTS pcs(id TEXT PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, last_seen REAL, online INTEGER NOT NULL DEFAULT 0, device_uuid TEXT, archived INTEGER NOT NULL DEFAULT 0, admin_locked INTEGER NOT NULL DEFAULT 0, session_bonus_seconds INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS rate_rules(denomination_centavos INTEGER PRIMARY KEY, seconds INTEGER NOT NULL CHECK(seconds >= 0), points INTEGER NOT NULL DEFAULT 0 CHECK(points >= 0));
+        CREATE TABLE IF NOT EXISTS coin_sessions(id TEXT PRIMARY KEY, pc_id TEXT NOT NULL REFERENCES pcs(id), status TEXT NOT NULL, amount_centavos INTEGER NOT NULL DEFAULT 0, started_at REAL NOT NULL, last_coin_at REAL, finalized_at REAL, transaction_id TEXT UNIQUE, error TEXT NOT NULL DEFAULT '', player_id INTEGER REFERENCES player_accounts(id));
         CREATE TABLE IF NOT EXISTS coin_batches(id INTEGER PRIMARY KEY AUTOINCREMENT, coin_session_id TEXT NOT NULL REFERENCES coin_sessions(id), denomination_centavos INTEGER NOT NULL, received_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY, coin_session_id TEXT NOT NULL UNIQUE REFERENCES coin_sessions(id), pc_id TEXT NOT NULL REFERENCES pcs(id), amount_centavos INTEGER NOT NULL, purchased_seconds INTEGER NOT NULL, created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS active_sessions(id TEXT PRIMARY KEY, transaction_id TEXT NOT NULL UNIQUE REFERENCES transactions(id), pc_id TEXT NOT NULL REFERENCES pcs(id), started_at REAL NOT NULL, expires_at REAL NOT NULL, status TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS shutdown_completions(pc_id TEXT NOT NULL REFERENCES pcs(id) ON DELETE CASCADE, expired_at REAL NOT NULL, completed_at REAL NOT NULL, PRIMARY KEY(pc_id,expired_at));
         CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS connection_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, pc_id TEXT, hostname TEXT NOT NULL DEFAULT '', source_ip TEXT NOT NULL DEFAULT '', event TEXT NOT NULL, outcome TEXT NOT NULL, details TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS maintenance_sessions(pc_id TEXT PRIMARY KEY REFERENCES pcs(id), enabled INTEGER NOT NULL DEFAULT 0, changed_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS maintenance_sessions(pc_id TEXT PRIMARY KEY REFERENCES pcs(id), enabled INTEGER NOT NULL DEFAULT 0, changed_at REAL NOT NULL, shutdown_remaining_seconds INTEGER);
         CREATE TABLE IF NOT EXISTS admin_users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_salt TEXT NOT NULL, password_hash TEXT NOT NULL, must_change_password INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS admin_sessions(token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS player_accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL COLLATE NOCASE UNIQUE, password_salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at REAL NOT NULL, disabled INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS player_sessions(token_hash TEXT PRIMARY KEY, player_id INTEGER NOT NULL REFERENCES player_accounts(id) ON DELETE CASCADE, created_at REAL NOT NULL, expires_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS player_monthly_points(player_id INTEGER NOT NULL REFERENCES player_accounts(id) ON DELETE CASCADE, month TEXT NOT NULL, points INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL, PRIMARY KEY(player_id,month));
+        CREATE TABLE IF NOT EXISTS game_settings(id INTEGER PRIMARY KEY CHECK(id=1), settings_json TEXT NOT NULL, points_per_peso INTEGER NOT NULL DEFAULT 1, game_cost_centavos INTEGER NOT NULL DEFAULT 500, updated_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS game_plays(id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_id TEXT NOT NULL UNIQUE REFERENCES transactions(id), pc_id TEXT NOT NULL REFERENCES pcs(id), game TEXT NOT NULL, cost_seconds INTEGER NOT NULL, bonus_seconds INTEGER NOT NULL, result_json TEXT NOT NULL, created_at REAL NOT NULL, bonus_applied INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS session_game_plays(request_id TEXT PRIMARY KEY, transaction_id TEXT REFERENCES transactions(id), amount_centavos INTEGER NOT NULL DEFAULT 0, pc_id TEXT NOT NULL REFERENCES pcs(id), player_id INTEGER NOT NULL REFERENCES player_accounts(id), game TEXT NOT NULL, cost_seconds INTEGER NOT NULL, bonus_seconds INTEGER NOT NULL, result_json TEXT NOT NULL, created_at REAL NOT NULL, bonus_applied INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS security_global(id INTEGER PRIMARY KEY CHECK(id=1), policy_json TEXT NOT NULL, updated_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS security_pc_overrides(pc_id TEXT PRIMARY KEY REFERENCES pcs(id) ON DELETE CASCADE, policy_json TEXT NOT NULL, updated_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS client_health(pc_id TEXT PRIMARY KEY REFERENCES pcs(id) ON DELETE CASCADE, at REAL NOT NULL, service_state TEXT NOT NULL, guard_state TEXT NOT NULL, client_state TEXT NOT NULL, service_pid INTEGER, guard_pid INTEGER, client_pid INTEGER, session_id INTEGER, network_connected INTEGER NOT NULL DEFAULT 0, version TEXT NOT NULL DEFAULT '3D');
+        CREATE TABLE IF NOT EXISTS client_update_leases(pc_id TEXT PRIMARY KEY REFERENCES pcs(id) ON DELETE CASCADE, build_id INTEGER NOT NULL, expires_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS component_heartbeats(pc_id TEXT NOT NULL REFERENCES pcs(id) ON DELETE CASCADE, component TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(pc_id,component));
         CREATE TABLE IF NOT EXISTS wallpapers(id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, filename TEXT NOT NULL, content_type TEXT NOT NULL, file_path TEXT NOT NULL, lockscreen_enabled INTEGER NOT NULL DEFAULT 1, desktop_enabled INTEGER NOT NULL DEFAULT 0, fit_mode TEXT NOT NULL DEFAULT 'fill', created_at REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS client_builds(id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT NOT NULL, filename TEXT NOT NULL, file_path TEXT NOT NULL, sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1);
@@ -235,6 +262,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS telegram_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL, created_at REAL NOT NULL, last_error TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS v2_audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS workstation_commands(id INTEGER PRIMARY KEY AUTOINCREMENT, pc_id TEXT NOT NULL REFERENCES pcs(id) ON DELETE CASCADE, command TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL, expires_at REAL NOT NULL, completed_at REAL, result TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS members(rowid INTEGER PRIMARY KEY, member_id TEXT, active_pc_ip TEXT, active_pc_name TEXT, name TEXT, username TEXT, password TEXT, remaining_time TEXT, vip_rem_time TEXT, vvip_rem_time TEXT, points TEXT, vip_points TEXT, vvip_points TEXT, credit TEXT, session_id TEXT, login_status TEXT, login_pctier TEXT, status TEXT, date_inserted TEXT, last_update TEXT, nonvip_attempt TEXT, vip_attempt TEXT, vvip_attempt TEXT, nonvip_last_login TEXT, vip_last_login TEXT, vvip_last_login TEXT, nonvip_activetime_snapshot TEXT, vip_activetime_snapshot TEXT, vvip_activetime_snapshot TEXT, pctier TEXT, branchid TEXT, last_spin TEXT, referred_by TEXT);
         ''')
         # Backward-compatible migration for existing PisoNet databases.
         cols = {r['name'] for r in db.execute('PRAGMA table_info(pcs)')}
@@ -247,11 +275,32 @@ def init_db():
         if 'client_shutdown_reset_at' not in cols: db.execute('ALTER TABLE pcs ADD COLUMN client_shutdown_reset_at REAL NOT NULL DEFAULT 0')
         if 'client_shutdown_reset_until' not in cols: db.execute('ALTER TABLE pcs ADD COLUMN client_shutdown_reset_until REAL NOT NULL DEFAULT 0')
         if 'client_boot_id' not in cols: db.execute("ALTER TABLE pcs ADD COLUMN client_boot_id TEXT NOT NULL DEFAULT ''")
+        if 'client_player_logout_pending' not in cols: db.execute('ALTER TABLE pcs ADD COLUMN client_player_logout_pending INTEGER NOT NULL DEFAULT 0')
         if 'admin_locked' not in cols: db.execute('ALTER TABLE pcs ADD COLUMN admin_locked INTEGER NOT NULL DEFAULT 0')
+        if 'session_bonus_seconds' not in cols: db.execute('ALTER TABLE pcs ADD COLUMN session_bonus_seconds INTEGER NOT NULL DEFAULT 0')
+        maintenance_cols={r['name'] for r in db.execute('PRAGMA table_info(maintenance_sessions)')}
+        if 'shutdown_remaining_seconds' not in maintenance_cols: db.execute('ALTER TABLE maintenance_sessions ADD COLUMN shutdown_remaining_seconds INTEGER')
+        session_game_cols={r['name'] for r in db.execute('PRAGMA table_info(session_game_plays)')}
+        if 'transaction_id' not in session_game_cols: db.execute('ALTER TABLE session_game_plays ADD COLUMN transaction_id TEXT REFERENCES transactions(id)')
+        if 'amount_centavos' not in session_game_cols: db.execute('ALTER TABLE session_game_plays ADD COLUMN amount_centavos INTEGER NOT NULL DEFAULT 0')
+        game_cols={r['name'] for r in db.execute('PRAGMA table_info(game_settings)')}
+        if 'game_cost_centavos' not in game_cols: db.execute('ALTER TABLE game_settings ADD COLUMN game_cost_centavos INTEGER NOT NULL DEFAULT 500')
+        play_cols={r['name'] for r in db.execute('PRAGMA table_info(game_plays)')}
+        if 'bonus_applied' not in play_cols: db.execute('ALTER TABLE game_plays ADD COLUMN bonus_applied INTEGER NOT NULL DEFAULT 1')
+        coin_cols={r['name'] for r in db.execute('PRAGMA table_info(coin_sessions)')}
+        if 'player_id' not in coin_cols: db.execute('ALTER TABLE coin_sessions ADD COLUMN player_id INTEGER REFERENCES player_accounts(id)')
+        db.execute('INSERT OR IGNORE INTO game_settings(id,settings_json,points_per_peso,updated_at) VALUES (1,?,?,?)',
+                   (json.dumps(default_game_settings(),separators=(',',':')),1,time.time()))
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_pcs_device_uuid ON pcs(device_uuid) WHERE device_uuid IS NOT NULL')
+        rate_cols={r['name'] for r in db.execute('PRAGMA table_info(rate_rules)')}
+        if 'points' not in rate_cols:
+            db.execute('ALTER TABLE rate_rules ADD COLUMN points INTEGER NOT NULL DEFAULT 0')
+            multiplier=db.execute('SELECT points_per_peso FROM game_settings WHERE id=1').fetchone()
+            db.execute('UPDATE rate_rules SET points=(denomination_centavos/100)*?',(int(multiplier['points_per_peso']) if multiplier else 1,))
         defaults = {100:180, 500:900, 1000:1800, 2000:3600}
         for denom, secs in defaults.items():
-            db.execute('INSERT OR IGNORE INTO rate_rules VALUES (?,?)', (denom, secs))
+            multiplier=db.execute('SELECT points_per_peso FROM game_settings WHERE id=1').fetchone()
+            db.execute('INSERT OR IGNORE INTO rate_rules(denomination_centavos,seconds,points) VALUES (?,?,?)', (denom, secs, (denom//100)*(int(multiplier['points_per_peso']) if multiplier else 1)))
         db.execute("INSERT OR IGNORE INTO settings VALUES ('schema_version','1')")
         db.execute("INSERT OR IGNORE INTO settings VALUES ('shutdown_countdown_minutes','5')")
         db.execute("INSERT OR IGNORE INTO settings VALUES ('insert_countdown_seconds','60')")
@@ -388,18 +437,30 @@ def finalize(session_id, reason='done'):
             pc=db.execute('SELECT name FROM pcs WHERE id=?',(row['pc_id'],)).fetchone()
             write_coin_event('insertion_ended','no_coin' if reason!='user_cancelled' else 'cancelled',row['pc_id'],pc['name'] if pc else row['pc_id'],session_id,details=reason)
             return {'status':'cancelled','session_id':session_id}
-        rates = {r['denomination_centavos']:r['seconds'] for r in db.execute('SELECT * FROM rate_rules')}
+        rates = {r['denomination_centavos']:dict(r) for r in db.execute('SELECT * FROM rate_rules')}
         total_seconds = 0
+        total_points = 0
         for batch in db.execute('SELECT denomination_centavos, COUNT(*) n FROM coin_batches WHERE coin_session_id=? GROUP BY denomination_centavos',(session_id,)):
             if batch['denomination_centavos'] not in rates: raise ValueError('RATE_MISSING_FOR_COIN')
-            total_seconds += rates[batch['denomination_centavos']] * batch['n']
+            rate=rates[batch['denomination_centavos']]
+            total_seconds += int(rate['seconds']) * batch['n']
+            total_points += int(rate['points']) * batch['n']
         txid = str(uuid.uuid4()); now = time.time()
         db.execute('INSERT INTO transactions VALUES (?,?,?,?,?,?)',(txid,session_id,row['pc_id'],row['amount_centavos'],total_seconds,now))
         current = db.execute("SELECT * FROM active_sessions WHERE pc_id=? AND status='active' AND expires_at>? ORDER BY expires_at DESC LIMIT 1",(row['pc_id'],now)).fetchone()
         # Add-on purchases extend the latest active expiry; expired sessions restart from now.
         new_expiry = (current['expires_at'] if current else now) + total_seconds
+        if not current:
+            db.execute('UPDATE pcs SET session_bonus_seconds=0 WHERE id=?',(row['pc_id'],))
         active_id = str(uuid.uuid4())
-        db.execute('INSERT INTO active_sessions VALUES (?,?,?,?,?,?)',(active_id,txid,row['pc_id'],now,new_expiry,'active'))
+        db.execute('INSERT INTO active_sessions(id,transaction_id,pc_id,started_at,expires_at,status) VALUES (?,?,?,?,?,?)',(active_id,txid,row['pc_id'],now,new_expiry,'active'))
+        db.execute('UPDATE maintenance_sessions SET shutdown_remaining_seconds=NULL WHERE pc_id=?',(row['pc_id'],))
+        points_awarded=0
+        if row['player_id']:
+            points_awarded=total_points
+            if points_awarded:
+                month=time.strftime('%Y-%m',time.localtime(now))
+                db.execute('INSERT INTO player_monthly_points(player_id,month,points,updated_at) VALUES (?,?,?,?) ON CONFLICT(player_id,month) DO UPDATE SET points=player_monthly_points.points+excluded.points,updated_at=excluded.updated_at',(row['player_id'],month,points_awarded,now))
         db.execute('UPDATE pcs SET client_shutdown_reset_at=0,client_shutdown_reset_until=0,admin_locked=0 WHERE id=?',(row['pc_id'],))
         db.execute("UPDATE coin_sessions SET status='finalized', finalized_at=?, transaction_id=? WHERE id=?",(now,txid,session_id))
         audit(db,row['pc_id'],'coin_transaction_finalized',{'session_id':session_id,'transaction_id':txid,'amount_centavos':row['amount_centavos'],'seconds':total_seconds,'reason':reason})
@@ -419,7 +480,11 @@ def finalize(session_id, reason='done'):
             credited_at=datetime.fromtimestamp(now,resolve_timezone(cfg['timezone'] or 'Asia/Manila')).strftime('%I:%M:%S %p').lstrip('0')
             message='🪙 PisoNet — Coin Credit\nPC: %s\nAmount: ₱%.2f\nTime credited: %s\nTime: %s\nTransaction: %s'%(pc_name,row['amount_centavos']/100,credited,credited_at,txid)
             enqueue_telegram(db,'coin-credit:'+txid,{'text':message})
-        return transaction_view(db,tx)
+        result=transaction_view(db,tx);result['points_awarded']=points_awarded
+        if row['player_id']:
+            player=db.execute('SELECT username FROM player_accounts WHERE id=?',(row['player_id'],)).fetchone()
+            result['player_username']=player['username'] if player else ''
+        return result
 
 
 def transaction_view(db, tx):
@@ -481,7 +546,12 @@ def record_decoded_coin(session_id, denomination_centavos, pulse_count):
             raise SignalError("UNSUPPORTED_DENOMINATION")
         cur=db.execute("INSERT INTO coin_batches(coin_session_id,denomination_centavos,received_at) VALUES (?,?,?)",(session_id,denomination_centavos,now))
         db.execute("UPDATE coin_sessions SET amount_centavos=amount_centavos+?,last_coin_at=? WHERE id=?",(denomination_centavos,now,session_id))
+        shutdown_cfg=db.execute("SELECT value FROM settings WHERE key='shutdown_countdown_minutes'").fetchone()
+        shutdown_minutes=max(1,min(60,int(shutdown_cfg['value']) if shutdown_cfg else 5))
+        db.execute('UPDATE pcs SET client_shutdown_reset_at=?,client_shutdown_reset_until=? WHERE id=?',(now,now+shutdown_minutes*60,row['pc_id']))
+        db.execute('DELETE FROM shutdown_completions WHERE pc_id=?',(row['pc_id'],))
         audit(db,row['pc_id'],'coin_pulse_decoded',{'session_id':session_id,'denomination_centavos':denomination_centavos,'pulse_count':pulse_count})
+        audit(db,row['pc_id'],'shutdown_countdown_restarted_for_coin',{'session_id':session_id,'shutdown_countdown_minutes':shutdown_minutes})
         pc=db.execute('SELECT name FROM pcs WHERE id=?',(row['pc_id'],)).fetchone()
         write_coin_event('pulse_detected','success',row['pc_id'],pc['name'] if pc else row['pc_id'],session_id,amount_centavos=denomination_centavos,pulse_count=pulse_count)
 
@@ -771,9 +841,49 @@ class Handler(BaseHTTPRequestHandler):
         h=self.headers.get('Authorization','')
         if not h.startswith('Bearer '): return None
         return pc_by_token(db,h[7:])
+    def player(self, db):
+        token=self.headers.get('X-Player-Token','').strip()
+        if not token: return None
+        return db.execute('SELECT p.id,p.username FROM player_sessions s JOIN player_accounts p ON p.id=s.player_id WHERE s.token_hash=? AND s.expires_at>? AND p.disabled=0',(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone()
     def do_OPTIONS(self): self.send_json(200,{'ok':True})
     def do_GET(self):
         path=urlparse(self.path).path
+        if path=='/api/player/me':
+            with connect() as db:
+                player=self.player(db)
+                if not player:return self.send_json(401,{'error':'PLAYER_LOGIN_REQUIRED'})
+                month=time.strftime('%Y-%m',time.localtime())
+                row=db.execute('SELECT points FROM player_monthly_points WHERE player_id=? AND month=?',(player['id'],month)).fetchone()
+                return self.send_json(200,{'username':player['username'],'points':int(row['points']) if row else 0,'month':month})
+        if path=='/api/games/leaderboard':
+            month=time.strftime('%Y-%m',time.localtime())
+            with connect() as db:
+                rows=db.execute('SELECT p.username,mp.points FROM player_monthly_points mp JOIN player_accounts p ON p.id=mp.player_id WHERE mp.month=? AND p.disabled=0 ORDER BY mp.points DESC,p.username COLLATE NOCASE LIMIT 3',(month,)).fetchall()
+                return self.send_json(200,{'month':month,'players':[{'rank':i+1,'username':r['username'],'points':int(r['points'])} for i,r in enumerate(rows)]})
+        if path=='/api/v2/game-settings':
+            if not self.admin():return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            with connect() as db:
+                row=db.execute('SELECT settings_json,points_per_peso,game_cost_centavos,updated_at FROM game_settings WHERE id=1').fetchone()
+                return self.send_json(200,{'games':json.loads(row['settings_json']),'points_per_peso':int(row['points_per_peso']),'game_cost_pesos':int(row['game_cost_centavos'])/100,'updated_at':row['updated_at']})
+        if path=='/api/v2/members':
+            if not self.admin():return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            month=time.strftime('%Y-%m',time.localtime())
+            with connect() as db:
+                rows=db.execute('''SELECT p.id,p.username,p.created_at,p.disabled,
+                    COALESCE((SELECT SUM(m.points) FROM player_monthly_points m WHERE m.player_id=p.id),0) AS lifetime_points,
+                    COALESCE((SELECT points FROM player_monthly_points m WHERE m.player_id=p.id AND m.month=?),0) AS month_points,
+                    COALESCE((SELECT SUM(t.amount_centavos) FROM coin_sessions c JOIN transactions t ON t.coin_session_id=c.id WHERE c.player_id=p.id),0) AS credited_centavos,
+                    (SELECT MAX(t.created_at) FROM coin_sessions c JOIN transactions t ON t.coin_session_id=c.id WHERE c.player_id=p.id) AS last_credit_at
+                    FROM player_accounts p ORDER BY p.created_at DESC,p.username COLLATE NOCASE''',(month,)).fetchall()
+            members=[{'id':int(row['id']),'username':row['username'],'created_at':float(row['created_at']),'disabled':bool(row['disabled']),'lifetime_points':int(row['lifetime_points']),'month_points':int(row['month_points']),'credited_centavos':int(row['credited_centavos']),'last_credit_at':row['last_credit_at']} for row in rows]
+            return self.send_json(200,{'month':month,'count':len(members),'members':members})
+        if path=='/api/v2/ftech-members':
+            if not self.admin():return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            select_columns=','.join('"'+name+'"' for name in FTECH_MEMBER_COLUMNS if name!='password')
+            with connect() as db:
+                rows=db.execute(f'SELECT rowid,{select_columns},CASE WHEN COALESCE(password,\'\')<>\'\' THEN 1 ELSE 0 END AS has_password FROM members ORDER BY rowid').fetchall()
+            visible_columns=['rowid',*[name for name in FTECH_MEMBER_COLUMNS if name!='password'],'has_password']
+            return self.send_json(200,{'count':len(rows),'columns':visible_columns,'members':[dict(row) for row in rows]})
         if path=='/api/v2/spectate/frame':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             pcid=parse_qs(urlparse(self.path).query).get('pc_id',[''])[0]
@@ -846,11 +956,28 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError: return self.send_json(404,{'error':'INSERT_SOUND_FILE_MISSING'})
                 return self.send_json(200,{'id':sound_id,'filename':values.get('insert_sound_filename',''),'content_type':values.get('insert_sound_content_type','audio/mpeg'),'data_base64':base64.b64encode(payload).decode('ascii')})
         if path == '/api/client/updates/latest':
-            with connect() as db:
+            with LOCK,connect() as db:
                 pc=self.client(db)
                 if not pc: return self.send_json(401, {'error':'CLIENT_AUTH_REQUIRED'})
                 query=parse_qs(urlparse(self.path).query)
                 requested_type=(query.get('package_type',[''])[0] or '').lower()
+                lease=db.execute('SELECT l.build_id,l.expires_at,b.version FROM client_update_leases l LEFT JOIN client_builds b ON b.id=l.build_id WHERE l.pc_id=?',(pc['id'],)).fetchone()
+                update_completed=False
+                current_version=(query.get('current_version',[''])[0] or '').strip()
+                retry=(query.get('retry',[''])[0] or '')=='1'
+                if lease and (float(lease['expires_at'])<=time.time() or retry):
+                    db.execute('DELETE FROM client_update_leases WHERE pc_id=?',(pc['id'],));lease=None
+                if lease and current_version and lease['version']:
+                    try:
+                        import re
+                        if re.fullmatch(r'\d+(?:\.\d+){1,2}',current_version):
+                            current=tuple(int(part) for part in current_version.split('.'))
+                            target=tuple(int(part) for part in str(lease['version']).split('.'))
+                            width=max(len(current),len(target));current=current+(0,)*(width-len(current));target=target+(0,)*(width-len(target))
+                            if current>=target:
+                                db.execute('DELETE FROM client_update_leases WHERE pc_id=?',(pc['id'],));lease=None;update_completed=True
+                    except (TypeError,ValueError):
+                        pass
                 if requested_type=='client':
                     # Automatic startup updates must compare like-for-like with
                     # the client executable. Keep using the latest client-only
@@ -864,9 +991,9 @@ class Handler(BaseHTTPRequestHandler):
                     update={**dict(row),'package_type':package_type,'url':download}
                 else:
                     update=None
-                return self.send_json(200, {'update':update})
+                return self.send_json(200, {'update':update,'update_completed':update_completed,'update_in_progress':bool(lease and float(lease['expires_at'])>time.time())})
         if path.startswith('/api/client/updates/') and path.endswith('/download'):
-            with connect() as db:
+            with LOCK,connect() as db:
                 pc=self.client(db)
                 if not pc: return self.send_json(401, {'error':'CLIENT_AUTH_REQUIRED'})
                 build_id=path.split('/')[-2]
@@ -878,6 +1005,28 @@ class Handler(BaseHTTPRequestHandler):
                 if not row: return self.send_json(404,{'error':'CLIENT_BUILD_NOT_FOUND'})
                 try: payload=Path(row['file_path']).read_bytes()
                 except OSError: return self.send_json(404,{'error':'CLIENT_BUILD_FILE_MISSING'})
+                now=time.time()
+                lease=db.execute('SELECT expires_at FROM client_update_leases WHERE pc_id=?',(pc['id'],)).fetchone()
+                if lease and float(lease['expires_at'])>now:
+                    return self.send_json(409,{'error':'CLIENT_UPDATE_ALREADY_RUNNING','message':'Another client instance is already applying this update.'})
+                db.execute('DELETE FROM client_update_leases WHERE pc_id=?',(pc['id'],))
+                db.execute('INSERT INTO client_update_leases(pc_id,build_id,expires_at) VALUES (?,?,?)',(pc['id'],int(build_id),now+120))
+                if (query.get('package_type',[''])[0] or '').lower()=='client':
+                    prior=db.execute('SELECT enabled,changed_at,shutdown_remaining_seconds FROM maintenance_sessions WHERE pc_id=?',(pc['id'],)).fetchone()
+                    pause_remaining=prior['shutdown_remaining_seconds'] if prior and prior['enabled'] else None
+                    if not (prior and prior['enabled']):
+                        if prior and pause_remaining is not None and int(pause_remaining)>=0:
+                            pause_remaining=max(0,int(pause_remaining-(now-float(prior['changed_at']))))
+                        else:
+                            session_end=db.execute("SELECT expires_at FROM active_sessions WHERE pc_id=? AND status IN ('active','expired') ORDER BY expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
+                            if session_end and float(session_end['expires_at'])<=now:
+                                shutdown_cfg=db.execute("SELECT value FROM settings WHERE key='shutdown_countdown_minutes'").fetchone()
+                                pause_remaining=max(0,int(float(session_end['expires_at'])+max(1,min(60,int(shutdown_cfg['value']) if shutdown_cfg else 5))*60-now))
+                            elif session_end:
+                                pause_remaining=-1
+                    db.execute('INSERT INTO maintenance_sessions(pc_id,enabled,changed_at,shutdown_remaining_seconds) VALUES (?,1,?,?) ON CONFLICT(pc_id) DO UPDATE SET enabled=1,changed_at=excluded.changed_at,shutdown_remaining_seconds=excluded.shutdown_remaining_seconds',(pc['id'],now,pause_remaining))
+                    db.execute('UPDATE pcs SET admin_locked=0 WHERE id=?',(pc['id'],))
+                    audit(db,pc['id'],'client_update_maintenance_started',{'build_id':int(build_id)})
                 self.send_response(200); self.send_header('Content-Type','application/vnd.microsoft.portable-executable'); self.send_header('Content-Length',str(len(payload))); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(payload); return
         if path=='/api/health': return self.send_json(200,{'ok':True,'service':'PisoNet','version':SERVER_VERSION,'build':SERVER_BUILD,'coin_engine':COIN_ENGINE.status(),'coin_hardware':COIN_HARDWARE.status()})
         with connect() as db:
@@ -1067,13 +1216,16 @@ class Handler(BaseHTTPRequestHandler):
                 query=parse_qs(urlparse(self.path).query)
                 component=(query.get('component',[''])[0] or '').lower()
                 boot_id=(query.get('boot_id',[''])[0] or '').strip()
-                if component=='client' and boot_id.isdigit() and len(boot_id)<=16 and boot_id!=str(pc['client_boot_id'] or ''):
+                if component in ('client','guard') and boot_id.isdigit() and len(boot_id)<=16 and boot_id!=str(pc['client_boot_id'] or ''):
                     shutdown_cfg=db.execute("SELECT value FROM settings WHERE key='shutdown_countdown_minutes'").fetchone()
                     shutdown_minutes=max(1,min(60,int(shutdown_cfg['value']) if shutdown_cfg else 5))
-                    db.execute('UPDATE pcs SET client_boot_id=?,client_shutdown_reset_at=?,client_shutdown_reset_until=? WHERE id=?',(boot_id,now,now+shutdown_minutes*60,pc['id']))
+                    db.execute('UPDATE pcs SET client_boot_id=?,client_shutdown_reset_at=?,client_shutdown_reset_until=?,client_player_logout_pending=1 WHERE id=?',(boot_id,now,now+shutdown_minutes*60,pc['id']))
                     db.execute('DELETE FROM shutdown_completions WHERE pc_id=?',(pc['id'],))
                     audit(db,pc['id'],'workstation_boot_detected',{'boot_id':boot_id,'previous_boot_id':str(pc['client_boot_id'] or ''),'shutdown_countdown_minutes':shutdown_minutes})
                     pc=db.execute('SELECT * FROM pcs WHERE id=?',(pc['id'],)).fetchone()
+                player_logout_required=bool(pc['client_player_logout_pending'])
+                if component=='client' and boot_id.isdigit() and boot_id==str(pc['client_boot_id'] or '') and player_logout_required:
+                    db.execute('UPDATE pcs SET client_player_logout_pending=0 WHERE id=?',(pc['id'],))
                 reported_name=(query.get('hostname',[''])[0] or '').strip()
                 if component=='client' and reported_name and len(reported_name)<=120 and reported_name!=pc['name']:
                     old_name=pc['name']
@@ -1089,7 +1241,10 @@ class Handler(BaseHTTPRequestHandler):
                 last_status_log=db.execute("SELECT at FROM connection_logs WHERE pc_id=? AND event='CLIENT_STATUS' AND outcome='CONNECTED' ORDER BY at DESC LIMIT 1",(pc['id'],)).fetchone()
                 if not was_online or not last_status_log or now-float(last_status_log['at'])>=60:
                     connection_log(db,pc['id'],pc['name'],self.client_address[0] if self.client_address else '', 'CLIENT_STATUS','CONNECTED','Authenticated status request succeeded')
-                db.execute("UPDATE active_sessions SET status='expired' WHERE pc_id=? AND status='active' AND expires_at<=?",(pc['id'],now))
+                legacy_pending=db.execute('SELECT COALESCE(SUM(bonus_seconds),0) seconds FROM game_plays WHERE pc_id=? AND bonus_applied=0',(pc['id'],)).fetchone()
+                session_pending=db.execute('SELECT COALESCE(SUM(bonus_seconds),0) seconds FROM session_game_plays WHERE pc_id=? AND bonus_applied=0',(pc['id'],)).fetchone()
+                pending_game_bonus=int(legacy_pending['seconds'] or 0)+int(session_pending['seconds'] or 0)
+                db.execute("UPDATE active_sessions SET status='expired' WHERE pc_id=? AND status='active' AND expires_at<=? AND NOT EXISTS (SELECT 1 FROM game_plays g WHERE g.pc_id=? AND g.bonus_applied=0 AND g.bonus_seconds>0) AND NOT EXISTS (SELECT 1 FROM session_game_plays g WHERE g.pc_id=? AND g.bonus_applied=0 AND g.bonus_seconds>0)",(pc['id'],now,pc['id'],pc['id']))
                 active=db.execute("SELECT a.*,t.amount_centavos,t.purchased_seconds FROM active_sessions a JOIN transactions t ON t.id=a.transaction_id WHERE a.pc_id=? AND a.status='active' ORDER BY a.expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
                 expired=db.execute("SELECT a.*,t.amount_centavos,t.purchased_seconds FROM active_sessions a JOIN transactions t ON t.id=a.transaction_id WHERE a.pc_id=? AND a.status='expired' ORDER BY a.expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
                 pending=db.execute("SELECT * FROM coin_sessions WHERE pc_id=? AND status='inserting' ORDER BY started_at DESC LIMIT 1",(pc['id'],)).fetchone()
@@ -1100,10 +1255,24 @@ class Handler(BaseHTTPRequestHandler):
                 client_shutdown_reset_at=float(pc['client_shutdown_reset_at'] or 0)
                 client_shutdown_reset_until=float(pc['client_shutdown_reset_until'] or 0)
                 shutdown_restarted_after_enable=bool(expired and not client_disabled and client_shutdown_reset_at>float(expired['expires_at']))
+                maintenance_state=db.execute('SELECT enabled,changed_at,shutdown_remaining_seconds FROM maintenance_sessions WHERE pc_id=?',(pc['id'],)).fetchone()
+                maintenance_enabled=bool(maintenance_state and maintenance_state['enabled'])
+                shutdown_grace_starts_on_lock=False
                 completion=db.execute('SELECT completed_at FROM shutdown_completions WHERE pc_id=? AND ABS(expired_at-?)<0.01',(pc['id'],expired['expires_at'])).fetchone() if expired else None
                 shutdown_done=bool(completion and (not shutdown_restarted_after_enable or float(completion['completed_at'])>=client_shutdown_reset_at))
                 if expired and not active:
                     shutdown_at=expired['expires_at']+shutdown_minutes*60
+                    pause_value=maintenance_state['shutdown_remaining_seconds'] if maintenance_state else None
+                    if maintenance_enabled and pause_value is not None:
+                        if int(pause_value)<0:
+                            # Session time expired while the machine was in maintenance.
+                            # Start a full grace period only after the admin locks it.
+                            shutdown_grace_starts_on_lock=True
+                            shutdown_at=now+max(1,min(60,shutdown_minutes))*60
+                        else:
+                            shutdown_at=now+int(pause_value)
+                    elif not maintenance_enabled and pause_value is not None and int(pause_value)>=0:
+                        shutdown_at=float(maintenance_state['changed_at'])+int(pause_value)
                     if shutdown_restarted_after_enable:
                         shutdown_at=max(shutdown_at,client_shutdown_reset_until)
                     expired_view={
@@ -1113,12 +1282,23 @@ class Handler(BaseHTTPRequestHandler):
                         'shutdown_at':shutdown_at,
                         'shutdown_remaining_seconds':0 if shutdown_done else max(0,int(shutdown_at-now)),
                         'shutdown_completed':shutdown_done,
+                        'shutdown_grace_starts_on_lock':shutdown_grace_starts_on_lock,
                     }
                 else:
                     expired_view=None
                 maintenance_verifier=(db.execute("SELECT value FROM settings WHERE key='maintenance_password_hash'").fetchone() or {'value':''})['value']
                 uninstall_verifier=(db.execute("SELECT value FROM settings WHERE key='uninstall_password_hash'").fetchone() or {'value':''})['value']
                 admin_locked=bool(pc['admin_locked'])
+                if active:
+                    raw_remaining=max(0,int(active['expires_at']-now))
+                    claimed_bonus=min(raw_remaining,max(0,int(pc['session_bonus_seconds'] or 0)))
+                    # A newly won game prize stays pending until the player presses
+                    # GO TO DESKTOP. It is shown in Bonus Time, but must not extend
+                    # Remaining Time or the actual expiry before that claim.
+                    session_view_data={'remaining_seconds':raw_remaining,'available_seconds':max(0,raw_remaining-claimed_bonus),'bonus_seconds':claimed_bonus+pending_game_bonus,'pending_bonus_seconds':pending_game_bonus,'expires_at':active['expires_at'],'purchased_seconds':active['purchased_seconds'],'amount_centavos':active['amount_centavos']}
+                else:
+                    session_view_data=None
+                    if pending_game_bonus<=0:db.execute('UPDATE pcs SET session_bonus_seconds=0 WHERE id=?',(pc['id'],))
                 # Execute queued workstation actions in the interactive Tauri client.
                 # The client invokes the same native Windows commands as its local controls.
                 admin_commands=[dict(r) for r in db.execute("SELECT id,command FROM workstation_commands WHERE pc_id=? AND status='pending' AND expires_at>? ORDER BY id LIMIT 20",(pc['id'],now))] if component=='client' else []
@@ -1126,7 +1306,7 @@ class Handler(BaseHTTPRequestHandler):
                 insert_sound=(lambda s: ({'id':s.get('insert_sound_id',''),'filename':s.get('insert_sound_filename','')} if s.get('insert_sound_id') else None))({r['key']:r['value'] for r in db.execute("SELECT key,value FROM settings WHERE key IN ('insert_sound_id','insert_sound_filename')")})
                 if sp.get('active') and now-float(sp.get('last_admin_at',0))>15:
                     sp.update({'active':False,'approved':False,'control_requested':False,'control_enabled':False,'commands':[]})
-                return self.send_json(200,{'pc_id':pc['id'],'name':pc['name'],'server_time':now,'client_disabled':client_disabled,'client_shutdown_reset_at':client_shutdown_reset_at,'admin_locked':admin_locked,'admin_commands':admin_commands,'shop_name':(db.execute("SELECT value FROM settings WHERE key='shop_name'").fetchone() or {'value':''})['value'],'shop_subtext':(db.execute("SELECT value FROM settings WHERE key='shop_subtext'").fetchone() or {'value':''})['value'],'shop_name_font':(db.execute("SELECT value FROM settings WHERE key='shop_name_font'").fetchone() or {'value':'system'})['value'],'shop_name_size':int((db.execute("SELECT value FROM settings WHERE key='shop_name_size'").fetchone() or {'value':'28'})['value']),'insert_sound':insert_sound,'spectate_requested':bool(sp.get('active') and not sp.get('approved')),'spectate_active':bool(sp.get('active') and sp.get('approved')),'spectate_control_requested':bool(sp.get('control_requested')),'spectate_control_enabled':bool(sp.get('control_enabled') and sp.get('control_expires_at',0)>now),'maintenance_password_verifier':maintenance_verifier,'uninstall_password_verifier':uninstall_verifier,'session':({'remaining_seconds':max(0,int(active['expires_at']-now)),'expires_at':active['expires_at'],'purchased_seconds':active['purchased_seconds'],'amount_centavos':active['amount_centavos']} if active else None),'expired_session':expired_view,'shutdown_countdown_minutes':shutdown_minutes,'insert_countdown_seconds':int((db.execute("SELECT value FROM settings WHERE key='insert_countdown_seconds'").fetchone() or {'value':'60'})['value']),'pending_coin_session':pending_view,'server_recovery_required':bool(pending_view and COIN_ENGINE.inhibited),'maintenance_mode':bool((db.execute('SELECT enabled FROM maintenance_sessions WHERE pc_id=?',(pc['id'],)).fetchone() or {'enabled':0})['enabled']),
+                return self.send_json(200,{'pc_id':pc['id'],'name':pc['name'],'server_time':now,'client_disabled':client_disabled,'client_shutdown_reset_at':client_shutdown_reset_at,'admin_locked':admin_locked,'admin_commands':admin_commands,'shop_name':(db.execute("SELECT value FROM settings WHERE key='shop_name'").fetchone() or {'value':''})['value'],'shop_subtext':(db.execute("SELECT value FROM settings WHERE key='shop_subtext'").fetchone() or {'value':''})['value'],'shop_name_font':(db.execute("SELECT value FROM settings WHERE key='shop_name_font'").fetchone() or {'value':'system'})['value'],'shop_name_size':int((db.execute("SELECT value FROM settings WHERE key='shop_name_size'").fetchone() or {'value':'28'})['value']),'enabled_games':[key for key,game in json.loads((db.execute("SELECT settings_json FROM game_settings WHERE id=1").fetchone() or {'settings_json':'{}'})['settings_json']).items() if game.get('enabled',True)],'player_logout_required':player_logout_required,'insert_sound':insert_sound,'spectate_requested':bool(sp.get('active') and not sp.get('approved')),'spectate_active':bool(sp.get('active') and sp.get('approved')),'spectate_control_requested':bool(sp.get('control_requested')),'spectate_control_enabled':bool(sp.get('control_enabled') and sp.get('control_expires_at',0)>now),'maintenance_password_verifier':maintenance_verifier,'uninstall_password_verifier':uninstall_verifier,'session':session_view_data,'expired_session':expired_view,'shutdown_countdown_minutes':shutdown_minutes,'insert_countdown_seconds':int((db.execute("SELECT value FROM settings WHERE key='insert_countdown_seconds'").fetchone() or {'value':'60'})['value']),'pending_coin_session':pending_view,'server_recovery_required':bool(pending_view and COIN_ENGINE.inhibited),'maintenance_mode':bool((db.execute('SELECT enabled FROM maintenance_sessions WHERE pc_id=?',(pc['id'],)).fetchone() or {'enabled':0})['enabled']),
                     'wallpaper': (lambda w: ({'id':w['id'],'filename':w['filename'],'content_type':w['content_type'],'lockscreen_enabled':bool(w['lockscreen_enabled']),'desktop_enabled':bool(w['desktop_enabled']),'fit_mode':w['fit_mode'],'url':'/api/wallpapers/'+str(w['id'])} if w else None))(db.execute("SELECT * FROM wallpapers WHERE scope IN ('lockscreen','global') AND active=1 AND lockscreen_enabled=1 ORDER BY CASE scope WHEN 'lockscreen' THEN 0 ELSE 1 END,id DESC LIMIT 1").fetchone()),
                     'desktop_wallpaper': (lambda w: ({'id':w['id'],'filename':w['filename'],'content_type':w['content_type'],'fit_mode':w['fit_mode'],'url':'/api/wallpapers/'+str(w['id'])} if w else None))(db.execute("SELECT * FROM wallpapers WHERE scope IN ('desktop','global') AND active=1 AND desktop_enabled=1 ORDER BY CASE scope WHEN 'desktop' THEN 0 ELSE 1 END,id DESC LIMIT 1").fetchone()),
                     'client_update': (lambda b: ({'id':b['id'],'version':b['version'],'package_type':'setup' if str(b['filename']).lower().startswith('pisonet-setup-') else 'client','sha256':b['sha256'],'size_bytes':b['size_bytes'],'url':'/api/client/updates/'+str(b['id'])+'/download'} if b else None))(db.execute('SELECT id,version,filename,sha256,size_bytes FROM client_builds WHERE active=1 ORDER BY id DESC LIMIT 1').fetchone()),
@@ -1167,6 +1347,206 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(201,{'ok':True,'id':build_id,'version':version,'filename':filename,'package_type':package_type,'sha256':digest,'size_bytes':len(raw)})
         try: data=self.body()
         except Exception: return self.send_json(400,{'error':'INVALID_JSON'})
+        if path=='/api/v2/members/import-ftech':
+            if not self.admin():return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            try:
+                encoded=str(data.get('file_base64',''))
+                if not encoded or len(encoded)>11*1024*1024: raise ValueError('IMPORT_FILE_SIZE_INVALID')
+                raw=base64.b64decode(encoded,validate=True)
+                if raw.startswith(b'\x1f\x8b'):
+                    import gzip
+                    with gzip.GzipFile(fileobj=__import__('io').BytesIO(raw),mode='rb') as stream: payload=stream.read(20*1024*1024+1)
+                else: payload=raw
+                if len(payload)>20*1024*1024: raise ValueError('IMPORT_FILE_SIZE_INVALID')
+                backup=json.loads(payload.decode('utf-8-sig'))
+                table=(backup.get('tables') or {}).get('members') if backup.get('format')=='FTECH_DB_BACKUP' else None
+                rows=table.get('rows') if isinstance(table,dict) else None
+                if not isinstance(rows,list) or len(rows)>20000: raise ValueError('FTECH_MEMBERS_TABLE_INVALID')
+                import_columns=['rowid',*FTECH_MEMBER_COLUMNS]
+                placeholders=','.join('?' for _ in import_columns)
+                updates=','.join('"'+name+'"=excluded."'+name+'"' for name in FTECH_MEMBER_COLUMNS)
+                quoted_columns=','.join('"'+name+'"' for name in import_columns)
+                created=updated=skipped=0
+                with LOCK,connect() as db:
+                    for source in rows:
+                        if not isinstance(source,dict): skipped+=1;continue
+                        username=str(source.get('username') or '').strip()
+                        if not username or len(username)>128 or any(ord(ch)<32 for ch in username): skipped+=1;continue
+                        raw_rowid=source.get('rowid')
+                        try: rowid=int(raw_rowid) if raw_rowid not in (None,'') else None
+                        except (TypeError,ValueError): rowid=None
+                        if rowid is not None and rowid<=0: rowid=None
+                        values=[rowid]+[None if source.get(name) is None else str(source.get(name)) for name in FTECH_MEMBER_COLUMNS]
+                        exists=db.execute('SELECT 1 FROM members WHERE rowid=?',(rowid,)).fetchone() if rowid is not None else None
+                        db.execute(f'INSERT INTO members ({quoted_columns}) VALUES ({placeholders}) ON CONFLICT(rowid) DO UPDATE SET {updates}',values)
+                        if exists: updated+=1
+                        else: created+=1
+                    audit(db,'admin','ftech_members_imported',{'created':created,'updated':updated,'skipped':skipped,'total_rows':len(rows)})
+                    total=int(db.execute('SELECT COUNT(*) FROM members').fetchone()[0])
+                return self.send_json(200,{'ok':True,'created':created,'updated':updated,'skipped':skipped,'count':total})
+            except (ValueError,UnicodeDecodeError,json.JSONDecodeError,OSError) as exc:
+                return self.send_json(400,{'error':str(exc) if str(exc).startswith(('IMPORT_','FTECH_')) else 'FTECH_BACKUP_INVALID'})
+        if path in ('/api/player/register','/api/player/login'):
+            username=str(data.get('username','')).strip();password=str(data.get('password',''))
+            if not re.fullmatch(r'[A-Za-z0-9_.-]{3,24}',username) or len(password)<8 or len(password)>128:
+                return self.send_json(400,{'error':'USERNAME_OR_PASSWORD_INVALID','message':'Username must be 3–24 letters, numbers, dots, underscores, or hyphens; password must be 8–128 characters.'})
+            with LOCK,connect() as db:
+                user=db.execute('SELECT * FROM player_accounts WHERE username=?',(username,)).fetchone()
+                if path.endswith('/register'):
+                    if user:return self.send_json(409,{'error':'PLAYER_USERNAME_TAKEN'})
+                    salt=secrets.token_bytes(16);digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,310000).hex()
+                    try: cur=db.execute('INSERT INTO player_accounts(username,password_salt,password_hash,created_at) VALUES (?,?,?,?)',(username,salt.hex(),digest,time.time()))
+                    except sqlite3.IntegrityError:return self.send_json(409,{'error':'PLAYER_USERNAME_TAKEN'})
+                    player_id=cur.lastrowid
+                else:
+                    if not user or user['disabled']:return self.send_json(401,{'error':'PLAYER_LOGIN_INVALID'})
+                    actual=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(user['password_salt']),310000).hex()
+                    if not secrets.compare_digest(actual,user['password_hash']):return self.send_json(401,{'error':'PLAYER_LOGIN_INVALID'})
+                    player_id=user['id']
+                token=secrets.token_urlsafe(32);expires=time.time()+30*86400
+                db.execute('INSERT INTO player_sessions(token_hash,player_id,created_at,expires_at) VALUES (?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),player_id,time.time(),expires))
+                month=time.strftime('%Y-%m',time.localtime());points=db.execute('SELECT points FROM player_monthly_points WHERE player_id=? AND month=?',(player_id,month)).fetchone()
+                return self.send_json(200,{'ok':True,'token':token,'username':username,'expires_at':expires,'points':int(points['points']) if points else 0,'month':month})
+        if path=='/api/player/logout':
+            token=self.headers.get('X-Player-Token','').strip()
+            now=time.time()
+            with LOCK,connect() as db:
+                player=self.player(db)
+                if not player:return self.send_json(401,{'error':'PLAYER_LOGIN_REQUIRED'})
+                pc=self.client(db)
+                if not pc:return self.send_json(401,{'error':'CLIENT_AUTH_REQUIRED'})
+                clear_time=data.get('clear_time',True) is not False
+                remaining=0
+                db.execute('UPDATE game_plays SET bonus_applied=2 WHERE pc_id=? AND bonus_applied=0',(pc['id'],))
+                db.execute('UPDATE session_game_plays SET bonus_applied=2 WHERE pc_id=? AND bonus_applied=0',(pc['id'],))
+                if clear_time:
+                    active=db.execute("SELECT MAX(expires_at) AS expires_at FROM active_sessions WHERE pc_id=? AND status='active'",(pc['id'],)).fetchone()
+                    remaining=max(0,int(float(active['expires_at'] or now)-now))
+                    db.execute("UPDATE active_sessions SET status='expired',expires_at=? WHERE pc_id=? AND status='active'",(now,pc['id']))
+                    db.execute('UPDATE pcs SET client_shutdown_reset_at=0,client_shutdown_reset_until=0,session_bonus_seconds=0 WHERE id=?',(pc['id'],))
+                db.execute('DELETE FROM player_sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),))
+                audit(db,pc['id'],'player_logout_time_cleared' if clear_time else 'player_logout_new_boot',{'player_id':player['id'],'username':player['username'],'cleared_seconds':remaining})
+                connection_log(db,pc['id'],pc['name'],self.client_address[0] if self.client_address else '', 'PLAYER_LOGOUT','TIME_CLEARED' if clear_time else 'NEW_SESSION_LOGOUT',f"Player {player['username']} logged out; cleared {remaining} seconds" if clear_time else f"Player {player['username']} was signed out after workstation reboot")
+            return self.send_json(200,{'ok':True,'cleared_seconds':remaining,'session_cleared':clear_time,'player_logged_out':True})
+        if path=='/api/v2/game-settings':
+            if not self.admin():return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            try:
+                points=int(data.get('points_per_peso',1));cost_centavos=int(round(float(data.get('game_cost_pesos',5))*100));games=data.get('games')
+                if points<0 or points>10000 or not 100<=cost_centavos<=10000 or cost_centavos%100 or not isinstance(games,dict):raise ValueError()
+                allowed={'spin','mystery','scratch','streak','progress','battle'}
+                if set(games)!=allowed:raise ValueError()
+                for key,game in games.items():
+                    if not isinstance(game,dict) or not isinstance(game.get('enabled',True),bool) or game.get('difficulty') not in ('easy','normal','hard') or not isinstance(game.get('prizes'),list) or len(game['prizes'])>12:raise ValueError()
+                    for prize in game['prizes']:
+                        minutes=int(prize.get('minutes',0));odds=float(prize.get('win_percent',0))
+                        if not 1<=minutes<=60 or not 0<=odds<=100:raise ValueError()
+                encoded=json.dumps(games,separators=(',',':'))
+            except (TypeError,ValueError,AttributeError):return self.send_json(400,{'error':'INVALID_GAME_SETTINGS'})
+            with connect() as db:
+                db.execute('UPDATE game_settings SET settings_json=?,points_per_peso=?,game_cost_centavos=?,updated_at=? WHERE id=1',(encoded,points,cost_centavos,time.time()))
+                audit(db,'admin','game_settings_updated',{'points_per_peso':points,'game_cost_centavos':cost_centavos})
+            return self.send_json(200,{'ok':True,'points_per_peso':points,'game_cost_pesos':cost_centavos/100})
+        if path=='/api/games/play':
+            with LOCK,connect() as db:
+                pc=self.client(db)
+                if not pc:return self.send_json(401,{'error':'CLIENT_AUTH_REQUIRED'})
+                player=self.player(db)
+                if not player:return self.send_json(401,{'error':'PLAYER_LOGIN_REQUIRED'})
+                game_key=str(data.get('game','')).strip().lower()
+                if game_key not in ('spin','mystery','scratch'):return self.send_json(400,{'error':'GAME_NOT_AVAILABLE'})
+                txid=str(data.get('transaction_id','')).strip()
+                request_id=str(data.get('request_id','')).strip() or ('legacy-'+txid if txid else '')
+                if not request_id or len(request_id)>100:return self.send_json(400,{'error':'GAME_REQUEST_ID_REQUIRED'})
+                prior=db.execute('SELECT * FROM session_game_plays WHERE request_id=?',(request_id,)).fetchone()
+                if prior:
+                    if prior['pc_id']!=pc['id'] or int(prior['player_id'])!=int(player['id']):return self.send_json(409,{'error':'GAME_REQUEST_ID_CONFLICT'})
+                    state=db.execute("SELECT expires_at FROM active_sessions WHERE pc_id=? AND status='active' ORDER BY expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
+                    left=max(0,int(float(state['expires_at'])-time.time())) if state else 0
+                    bonus_left=min(left,max(0,int(db.execute('SELECT session_bonus_seconds FROM pcs WHERE id=?',(pc['id'],)).fetchone()['session_bonus_seconds'] or 0)))
+                    return self.send_json(200,{'ok':True,'result':json.loads(prior['result_json']),'remaining_seconds':left,'available_seconds':max(0,left-bonus_left),'bonus_seconds':bonus_left,'pending_bonus_seconds':max(0,int(prior['bonus_seconds'])) if prior['bonus_applied']==0 else 0,'already_played':True})
+                if txid:
+                    tx=db.execute('SELECT t.*,c.player_id FROM transactions t JOIN coin_sessions c ON c.id=t.coin_session_id WHERE t.id=? AND t.pc_id=?',(txid,pc['id'])).fetchone()
+                    if not tx:return self.send_json(404,{'error':'TRANSACTION_NOT_FOUND'})
+                    if int(tx['player_id'] or 0)!=int(player['id']):return self.send_json(403,{'error':'TRANSACTION_PLAYER_MISMATCH'})
+                    if db.execute('SELECT 1 FROM game_plays WHERE transaction_id=?',(txid,)).fetchone() or db.execute('SELECT 1 FROM session_game_plays WHERE transaction_id=?',(txid,)).fetchone():return self.send_json(409,{'error':'GAME_ALREADY_PLAYED'})
+                if db.execute('SELECT 1 FROM game_plays WHERE pc_id=? AND bonus_applied=0 AND bonus_seconds>0 LIMIT 1',(pc['id'],)).fetchone() or db.execute('SELECT 1 FROM session_game_plays WHERE pc_id=? AND bonus_applied=0 AND bonus_seconds>0 LIMIT 1',(pc['id'],)).fetchone():return self.send_json(409,{'error':'GAME_BONUS_PENDING'})
+                active=db.execute("SELECT * FROM active_sessions WHERE pc_id=? AND status='active' AND expires_at>? ORDER BY expires_at DESC LIMIT 1",(pc['id'],time.time())).fetchone()
+                if not active:return self.send_json(409,{'error':'ACTIVE_SESSION_REQUIRED'})
+                config=db.execute('SELECT settings_json,game_cost_centavos FROM game_settings WHERE id=1').fetchone()
+                game_settings=json.loads(config['settings_json']).get(game_key,{})
+                if game_settings.get('enabled',True) is not True:return self.send_json(409,{'error':'GAME_DISABLED'})
+                cost_centavos=int(config['game_cost_centavos'])
+                if cost_centavos%100:return self.send_json(409,{'error':'GAME_COST_MUST_BE_WHOLE_PESO'})
+                rates=[(int(r['denomination_centavos']),int(r['seconds'])) for r in db.execute('SELECT * FROM rate_rules WHERE denomination_centavos>0 AND seconds>0 ORDER BY denomination_centavos')]
+                if not rates:return self.send_json(409,{'error':'GAME_COST_RATE_UNAVAILABLE'})
+                # Prefer the configured ₱1 rate; otherwise convert proportionally
+                # from the smallest configured coin rate so ₱1/₱2/etc. costs work.
+                rate_centavos,rate_seconds=next((item for item in rates if item[0]==100),rates[0])
+                cost_seconds=max(1,int(round(rate_seconds*cost_centavos/rate_centavos)))
+                now=time.time();remaining=max(0,int(active['expires_at']-now))
+                if remaining<600:return self.send_json(409,{'error':'GAME_REQUIRES_TEN_MINUTES','required_seconds':600,'remaining_seconds':remaining})
+                if remaining<cost_seconds:return self.send_json(409,{'error':'INSUFFICIENT_SESSION_TIME','required_seconds':cost_seconds,'remaining_seconds':remaining})
+                difficulty=game_settings.get('difficulty','normal')
+                multiplier={'easy':1.0,'normal':0.65,'hard':0.35}.get(difficulty,0.65)
+                prizes=game_settings.get('prizes',[])
+                rng=secrets.SystemRandom()
+                spin_count=max(1,int(tx['amount_centavos'])//1000) if game_key=='spin' and txid else 1
+                draws=[];bonus_seconds=0
+                for _ in range(spin_count):
+                    # Effective prize odds are difficulty-scaled; leftover is a no-prize outcome.
+                    entries=[(max(1,int(p.get('minutes',1))),max(0.0,min(100.0,float(p.get('win_percent',0))*multiplier))) for p in prizes]
+                    total=min(100.0,sum(odds for _,odds in entries));roll=rng.random()*100.0
+                    chosen=None;cursor=0.0
+                    if roll<total:
+                        for minutes,odds in entries:
+                            cursor+=odds
+                            if roll<cursor:chosen=minutes;break
+                    won=chosen or 0;bonus_seconds+=won*60;draws.append({'prize_minutes':won})
+                new_expiry=float(active['expires_at'])-cost_seconds
+                db.execute('UPDATE active_sessions SET expires_at=? WHERE id=?',(new_expiry,active['id']))
+                # Starting another paid play begins a fresh bonus display cycle;
+                # previously claimed minutes remain in the active expiry.
+                db.execute('UPDATE pcs SET session_bonus_seconds=0 WHERE id=?',(pc['id'],))
+                result={'game':game_key,'difficulty':difficulty,'spins':draws,'cost_seconds':cost_seconds,'bonus_seconds':bonus_seconds}
+                db.execute('INSERT INTO session_game_plays(request_id,transaction_id,amount_centavos,pc_id,player_id,game,cost_seconds,bonus_seconds,result_json,created_at,bonus_applied) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(request_id,txid or None,int(tx['amount_centavos']) if txid else 0,pc['id'],player['id'],game_key,cost_seconds,bonus_seconds,json.dumps(result,separators=(',',':')),now,1 if bonus_seconds<=0 else 0))
+                audit(db,pc['id'],'player_game_played',{'request_id':request_id,'transaction_id':txid or None,'player_id':player['id'],'game':game_key,'cost_seconds':cost_seconds,'bonus_seconds':bonus_seconds})
+                paid_remaining=max(0,int(new_expiry-now));claimed_bonus=min(paid_remaining,max(0,int(pc['session_bonus_seconds'] or 0)));pending_bonus=max(0,int(bonus_seconds))
+                return self.send_json(200,{'ok':True,'result':result,'remaining_seconds':paid_remaining,'available_seconds':max(0,paid_remaining-claimed_bonus),'bonus_seconds':claimed_bonus+pending_bonus,'pending_bonus_seconds':pending_bonus})
+        if path=='/api/games/settle-bonus':
+            with LOCK,connect() as db:
+                pc=self.client(db)
+                if not pc:return self.send_json(401,{'error':'CLIENT_AUTH_REQUIRED'})
+                db.execute('UPDATE pcs SET session_bonus_seconds=0 WHERE id=?',(pc['id'],))
+                active=db.execute("SELECT expires_at FROM active_sessions WHERE pc_id=? AND status='active' ORDER BY expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
+                remaining=max(0,int(float(active['expires_at'])-time.time())) if active else 0
+                return self.send_json(200,{'ok':True,'remaining_seconds':remaining,'available_seconds':remaining,'bonus_seconds':0})
+        if path=='/api/games/claim':
+            with LOCK,connect() as db:
+                pc=self.client(db)
+                if not pc:return self.send_json(401,{'error':'CLIENT_AUTH_REQUIRED'})
+                player=self.player(db)
+                if not player:return self.send_json(401,{'error':'PLAYER_LOGIN_REQUIRED'})
+                legacy_pending=db.execute("SELECT g.transaction_id,g.bonus_seconds FROM game_plays g JOIN transactions t ON t.id=g.transaction_id JOIN coin_sessions c ON c.id=t.coin_session_id WHERE g.pc_id=? AND c.player_id=? AND g.bonus_applied=0 ORDER BY g.id",(pc['id'],player['id'])).fetchall()
+                session_pending=db.execute('SELECT request_id transaction_id,bonus_seconds FROM session_game_plays WHERE pc_id=? AND player_id=? AND bonus_applied=0 ORDER BY created_at',(pc['id'],player['id'])).fetchall()
+                pending=list(legacy_pending)+list(session_pending)
+                bonus=sum(max(0,int(row['bonus_seconds'] or 0)) for row in pending)
+                now=time.time()
+                active=db.execute("SELECT * FROM active_sessions WHERE pc_id=? AND status='active' ORDER BY expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
+                if bonus and not active:return self.send_json(409,{'error':'ACTIVE_SESSION_REQUIRED'})
+                if active and pending:
+                    new_expiry=max(now,float(active['expires_at']))+bonus
+                    db.execute('UPDATE active_sessions SET expires_at=? WHERE id=?',(new_expiry,active['id']))
+                    db.execute('UPDATE pcs SET session_bonus_seconds=session_bonus_seconds+? WHERE id=?',(bonus,pc['id']))
+                    db.execute('UPDATE game_plays SET bonus_applied=1 WHERE pc_id=? AND bonus_applied=0 AND transaction_id IN (SELECT t.id FROM transactions t JOIN coin_sessions c ON c.id=t.coin_session_id WHERE c.player_id=?)',(pc['id'],player['id']))
+                    db.execute('UPDATE session_game_plays SET bonus_applied=1 WHERE pc_id=? AND player_id=? AND bonus_applied=0',(pc['id'],player['id']))
+                    audit(db,pc['id'],'player_game_bonus_claimed',{'player_id':player['id'],'game_requests':[row['transaction_id'] for row in pending],'bonus_seconds':bonus})
+                elif pending:
+                    db.execute('UPDATE game_plays SET bonus_applied=1 WHERE pc_id=? AND bonus_applied=0',(pc['id'],))
+                    db.execute('UPDATE session_game_plays SET bonus_applied=1 WHERE pc_id=? AND bonus_applied=0',(pc['id'],))
+                session=db.execute("SELECT expires_at FROM active_sessions WHERE pc_id=? AND status='active' ORDER BY expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
+                remaining=max(0,int(float(session['expires_at'])-now)) if session else 0
+                claimed_bonus=min(remaining,max(0,int(db.execute('SELECT session_bonus_seconds FROM pcs WHERE id=?',(pc['id'],)).fetchone()['session_bonus_seconds'] or 0)))
+                return self.send_json(200,{'ok':True,'claimed_bonus_seconds':bonus,'remaining_seconds':remaining,'available_seconds':max(0,remaining-claimed_bonus),'bonus_seconds':claimed_bonus,'already_claimed':not bool(pending)})
         if path=='/api/client/coin-event':
             with connect() as db:
                 pc=self.client(db)
@@ -1648,14 +2028,39 @@ class Handler(BaseHTTPRequestHandler):
                 if not valid:
                     audit(db,pc['id'],'maintenance_unlock_failed',{})
                     return self.send_json(403,{'error':'MAINTENANCE_PASSWORD_INVALID'})
-                db.execute('INSERT INTO maintenance_sessions(pc_id,enabled,changed_at) VALUES (?,1,?) ON CONFLICT(pc_id) DO UPDATE SET enabled=1,changed_at=excluded.changed_at',(pc['id'],time.time()))
+                now=time.time()
+                prior_maintenance=db.execute('SELECT enabled,changed_at,shutdown_remaining_seconds FROM maintenance_sessions WHERE pc_id=?',(pc['id'],)).fetchone()
+                pause_remaining=prior_maintenance['shutdown_remaining_seconds'] if prior_maintenance and prior_maintenance['enabled'] else None
+                if not (prior_maintenance and prior_maintenance['enabled']):
+                    if prior_maintenance and pause_remaining is not None and int(pause_remaining)>=0:
+                        pause_remaining=max(0,int(pause_remaining-(now-float(prior_maintenance['changed_at']))))
+                    else:
+                        session_end=db.execute("SELECT expires_at FROM active_sessions WHERE pc_id=? AND status IN ('active','expired') ORDER BY expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
+                        if session_end and float(session_end['expires_at'])<=now:
+                            shutdown_cfg=db.execute("SELECT value FROM settings WHERE key='shutdown_countdown_minutes'").fetchone()
+                            minutes=max(1,min(60,int(shutdown_cfg['value']) if shutdown_cfg else 5))
+                            pause_remaining=max(0,int(float(session_end['expires_at'])+minutes*60-now))
+                        elif session_end:
+                            # -1 means the shutdown grace period has not started yet.
+                            pause_remaining=-1
+                db.execute('INSERT INTO maintenance_sessions(pc_id,enabled,changed_at,shutdown_remaining_seconds) VALUES (?,1,?,?) ON CONFLICT(pc_id) DO UPDATE SET enabled=1,changed_at=excluded.changed_at,shutdown_remaining_seconds=excluded.shutdown_remaining_seconds',(pc['id'],now,pause_remaining))
                 db.execute('UPDATE pcs SET admin_locked=0 WHERE id=?',(pc['id'],))
                 audit(db,pc['id'],'maintenance_unlocked',{})
                 return self.send_json(200,{'ok':True,'maintenance_mode':True})
             if path=='/api/maintenance/lock':
                 pc=self.client(db)
                 if not pc: return self.send_json(401,{'error':'CLIENT_AUTH_REQUIRED'})
-                db.execute('INSERT INTO maintenance_sessions(pc_id,enabled,changed_at) VALUES (?,0,?) ON CONFLICT(pc_id) DO UPDATE SET enabled=0,changed_at=excluded.changed_at',(pc['id'],time.time()))
+                now=time.time()
+                maintenance_state=db.execute('SELECT shutdown_remaining_seconds FROM maintenance_sessions WHERE pc_id=?',(pc['id'],)).fetchone()
+                pause_remaining=maintenance_state['shutdown_remaining_seconds'] if maintenance_state else None
+                if pause_remaining is not None and int(pause_remaining)<0:
+                    session_end=db.execute("SELECT expires_at FROM active_sessions WHERE pc_id=? AND status IN ('active','expired') ORDER BY expires_at DESC LIMIT 1",(pc['id'],)).fetchone()
+                    if session_end and float(session_end['expires_at'])<=now:
+                        shutdown_cfg=db.execute("SELECT value FROM settings WHERE key='shutdown_countdown_minutes'").fetchone()
+                        pause_remaining=max(1,min(60,int(shutdown_cfg['value']) if shutdown_cfg else 5))*60
+                    else:
+                        pause_remaining=None
+                db.execute('INSERT INTO maintenance_sessions(pc_id,enabled,changed_at,shutdown_remaining_seconds) VALUES (?,0,?,?) ON CONFLICT(pc_id) DO UPDATE SET enabled=0,changed_at=excluded.changed_at,shutdown_remaining_seconds=excluded.shutdown_remaining_seconds',(pc['id'],now,pause_remaining))
                 db.execute('UPDATE pcs SET admin_locked=1 WHERE id=?',(pc['id'],))
                 audit(db,pc['id'],'maintenance_locked',{})
                 return self.send_json(200,{'ok':True,'maintenance_mode':False})
@@ -1702,8 +2107,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(409,{'error':'COIN_SLOT_BUSY','reserved_for':existing['pc_name'] or existing['pc_id'],'reserved_for_pc_id':existing['pc_id']})
                 if COIN_HARDWARE.port and not COIN_HARDWARE.connected:
                     return self.send_json(503,{'error':'COIN_SLOT_UNAVAILABLE','message':'The physical coin slot is not connected to the server.'})
-                sid=str(uuid.uuid4()); now=time.time()
-                db.execute("INSERT INTO coin_sessions(id,pc_id,status,started_at) VALUES (?,?,?,?)",(sid,pc['id'],'inserting',now)); audit(db,pc['id'],'coin_slot_reserved',{'session_id':sid})
+                sid=str(uuid.uuid4()); now=time.time();player=self.player(db)
+                db.execute("INSERT INTO coin_sessions(id,pc_id,status,started_at,player_id) VALUES (?,?,?,?,?)",(sid,pc['id'],'inserting',now,player['id'] if player else None)); audit(db,pc['id'],'coin_slot_reserved',{'session_id':sid,'player_username':player['username'] if player else ''})
                 try: COIN_ENGINE.reserve(pc['id'],sid)
                 except SignalError as e:
                     db.execute("UPDATE coin_sessions SET status='cancelled',finalized_at=? WHERE id=?",(time.time(),sid))
@@ -1814,8 +2219,14 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith('/api/coin-sessions/') and path.endswith('/done'):
                 pc=self.client(db)
                 if not pc: return self.send_json(401,{'error':'CLIENT_AUTH_REQUIRED'})
-                sid=path.split('/')[-2]; own=db.execute('SELECT 1 FROM coin_sessions WHERE id=? AND pc_id=?',(sid,pc['id'])).fetchone()
+                sid=path.split('/')[-2]; own=db.execute('SELECT * FROM coin_sessions WHERE id=? AND pc_id=?',(sid,pc['id'])).fetchone()
                 if not own: return self.send_json(404,{'error':'COIN_SESSION_NOT_FOUND'})
+                player=self.player(db)
+                if player:
+                    if own['player_id'] and own['player_id']!=player['id']:
+                        return self.send_json(403,{'error':'PLAYER_SESSION_MISMATCH'})
+                    if not own['player_id'] and own['status']=='inserting':
+                        db.execute('UPDATE coin_sessions SET player_id=? WHERE id=? AND pc_id=? AND player_id IS NULL',(player['id'],sid,pc['id']))
         if path.startswith('/api/coin-sessions/') and path.endswith('/done'):
             try:
                 # A physical coin pulse is only credited after the decoder's
@@ -1983,11 +2394,21 @@ class Handler(BaseHTTPRequestHandler):
         if not self.admin(): return self.send_json(401,{'error':'ADMIN_AUTH_REQUIRED'})
         try: rates=self.body().get('rates',[])
         except Exception: return self.send_json(400,{'error':'INVALID_JSON'})
-        if not rates or any(not isinstance(x.get('denomination_centavos'),int) or not isinstance(x.get('seconds'),int) or x['denomination_centavos']<=0 or x['seconds']<0 for x in rates): return self.send_json(400,{'error':'INVALID_RATES'})
+        if not isinstance(rates,list) or not rates:return self.send_json(400,{'error':'INVALID_RATES'})
+        fallback=1
+        with connect() as db:
+            cfg=db.execute('SELECT points_per_peso FROM game_settings WHERE id=1').fetchone()
+            if cfg: fallback=int(cfg['points_per_peso'])
+        normalized=[]
+        for item in rates:
+            if not isinstance(item,dict):return self.send_json(400,{'error':'INVALID_RATES'})
+            denom=item.get('denomination_centavos');seconds=item.get('seconds');points=item.get('points',(int(denom)//100)*fallback if isinstance(denom,int) else -1)
+            if not isinstance(denom,int) or isinstance(denom,bool) or not isinstance(seconds,int) or isinstance(seconds,bool) or not isinstance(points,int) or isinstance(points,bool) or denom<=0 or seconds<0 or not 0<=points<=100000:return self.send_json(400,{'error':'INVALID_RATES'})
+            normalized.append((denom,seconds,points))
         with connect() as db:
             db.execute('DELETE FROM rate_rules')
-            db.executemany('INSERT INTO rate_rules VALUES (?,?)',[(x['denomination_centavos'],x['seconds']) for x in rates]); audit(db,'admin','rates_updated',{'rates':rates})
-        return self.send_json(200,{'ok':True,'rates':rates})
+            db.executemany('INSERT INTO rate_rules(denomination_centavos,seconds,points) VALUES (?,?,?)',normalized); audit(db,'admin','rates_updated',{'rates':[{'denomination_centavos':d,'seconds':s,'points':p} for d,s,p in normalized]})
+        return self.send_json(200,{'ok':True,'rates':[{'denomination_centavos':d,'seconds':s,'points':p} for d,s,p in normalized]})
     def serve_file(self,path):
         try: body=path.read_bytes()
         except OSError: return self.send_json(404,{'error':'UI_NOT_FOUND'})

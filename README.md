@@ -3,7 +3,7 @@
 Public update channel for the PisoNet Windows server.
 
 - Branch: `release/server`
-- Server build: `0.34`
+- Server build: `0.47`
 - Files are listed with SHA-256 checksums in `manifest.json`.
 
 ## OTA behavior
@@ -22,3 +22,6 @@ Build `0.32` replaces workstation bulk action emoji with consistent, accessible 
 Build `0.33` reconciles the OTA page with the active server build, stops stale update polling, and reports same-version file differences clearly.
 
 Build `0.34` is a test build with no additional feature changes.
+
+
+Build `0.47` adds the FTECH members table schema and a members-only backup import in the admin UI, preserves session game rewards during time settlement, and updates workstation version and online-card presentation. The release manifest includes SHA-256 checksums for every OTA file.
