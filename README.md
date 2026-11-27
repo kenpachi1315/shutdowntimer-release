@@ -1,2 +1,33 @@
-# shutdowntimer-release
-autoshutdown time release only
+# PisoNet Server Release
+
+Public update channel for the PisoNet Windows server.
+
+- Branch: `release/server`
+- Server build: `0.49`
+- Files are listed with SHA-256 checksums in `manifest.json`.
+
+## OTA behavior
+
+Admin → Server OTA checks this branch. An administrator explicitly starts installation. The server downloads only the manifest allowlist over HTTPS, verifies SHA-256 checksums, stages backups, stops the `PisoNetServer` service, replaces the server Python modules and admin UI, then restarts the service. It checks `/api/health`; if the new build does not become healthy, it restores the previous files. SQLite data, service configuration, logs, client installs, and Telegram settings are outside the release payload.
+
+Build `0.29` adds the dedicated Server OTA page, Windows `C:\TEMP\PisoNetServerOTA` staging, Unix `/tmp/PisoNetServerOTA` staging, and manual recovery/rollback controls. It also removes the Policy application status panel. Servers earlier than build `0.18` do not have the OTA updater. Manually update those servers to build `0.19` once using these five files; later higher builds can be installed from the admin page. Servers already on `0.18` can install `0.19` directly from the admin page.
+
+
+Build `0.30` adds a separate paginated Coin Insertion Logs page with search, status filters, CSV export, and full history from the daily coin event files. The dashboard Coin insertion activity View all link opens that page; Connection logs remain separate. The Server OTA page layout is also aligned with the page container.
+
+Build `0.31` changes Coin Rates to HH:MM:SS inputs while preserving the server API’s seconds-based storage.
+
+Build `0.32` replaces workstation bulk action emoji with consistent, accessible SVG icons in the admin dashboard.
+
+Build `0.33` reconciles the OTA page with the active server build, stops stale update polling, and reports same-version file differences clearly.
+
+Build `0.34` is a test build with no additional feature changes.
+
+
+Build `0.47` adds the FTECH members table schema and a members-only backup import in the admin UI, preserves session game rewards during time settlement, and updates workstation version and online-card presentation. The release manifest includes SHA-256 checksums for every OTA file.
+
+
+Build `0.48` adds Overall Sales, Per PC Sales, and Per Member Sales reports with date, workstation, member, and coin denomination filters. Reports include recorded coin insertions; the other sales source checkboxes remain unavailable until those sources are stored by the server.
+
+
+Build `0.49` publishes the proposal-based live Admin UI wired to the current server APIs, including Overview, Workstations, Members, Transactions, Sales reports, Recordings, and management pages. Sales reports include Overall Sales, Per PC Sales, and Per Member Sales.
