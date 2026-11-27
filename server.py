@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.48'
+SERVER_BUILD = '0.49'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -122,6 +122,12 @@ LOGIN_GUARD_LOCK = threading.Lock()
 LOGIN_FAILURES = {}  # per-source-IP in-memory throttling; reset on server restart
 COIN_EVENT_DIR = ROOT / 'logs'
 COIN_EVENT_LOCK = threading.Lock()
+RECORDING_DIR = ROOT / 'records'
+RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+RECORDING_LOCK = threading.RLock()
+ACTIVE_RECORDINGS = {}
+MAX_RECORDING_BYTES = 512 * 1024 * 1024
+H264_ENCODER_CACHE = {}
 
 
 def connect():
@@ -130,6 +136,276 @@ def connect():
     db.execute('PRAGMA foreign_keys=ON')
     db.execute('PRAGMA journal_mode=WAL')
     return db
+
+
+def recording_settings(db=None):
+    close = db is None
+    db = db or connect()
+    try:
+        values = {r['key']: r['value'] for r in db.execute("SELECT key,value FROM settings WHERE key IN ('recordings_enabled','recordings_camera_index','recordings_camera_backend','recordings_camera_name','recordings_retention_days')")}
+        try: camera_index=int(values.get('recordings_camera_index', '0'))
+        except (TypeError,ValueError): camera_index=0
+        try: capture_backend=int(values.get('recordings_camera_backend', '0'))
+        except (TypeError,ValueError): capture_backend=0
+        try: retention_days=int(values.get('recordings_retention_days', '30'))
+        except (TypeError,ValueError): retention_days=30
+        return {
+            'enabled': values.get('recordings_enabled', '1') == '1',
+            'camera_index': max(0, min(65535, camera_index)),
+            'camera_backend': max(0, min(65535, capture_backend)),
+            'camera_name': str(values.get('recordings_camera_name','') or '').strip()[:160],
+            'retention_days': max(1, min(3650, retention_days)),
+        }
+    finally:
+        if close: db.close()
+
+
+def recording_update(session_id, **values):
+    allowed = {'status','started_at','stopped_at','duration_seconds','file_path','content_type','size_bytes','error'}
+    values = {k:v for k,v in values.items() if k in allowed}
+    if not values: return
+    with connect() as db:
+        db.execute('UPDATE recordings SET '+','.join(k+'=?' for k in values)+' WHERE coin_session_id=?',(*values.values(),session_id))
+
+
+def default_camera_backend(cv2):
+    if os.name=='nt' and hasattr(cv2,'CAP_DSHOW'): return cv2.CAP_DSHOW
+    if sys.platform=='darwin' and hasattr(cv2,'CAP_AVFOUNDATION'): return cv2.CAP_AVFOUNDATION
+    if sys.platform.startswith('linux') and hasattr(cv2,'CAP_V4L2'): return cv2.CAP_V4L2
+    return cv2.CAP_ANY
+
+
+def coin_engine_timestamp_ms():
+    """Return a nondecreasing monotonic timestamp for all server-side coin paths.
+
+    The simulator feeds a synthetic pulse train slightly into the future so that
+    HTTP scheduling jitter cannot distort pulse widths. Subsequent poll/edge
+    requests must not pass the raw monotonic clock until it catches up.
+    """
+    now_ms=time.monotonic()*1000
+    try: last_ms=COIN_ENGINE.status().get('last_ms')
+    except Exception: last_ms=None
+    return max(now_ms,float(last_ms or 0))
+
+
+def read_camera_frame(capture, attempts=24, delay=.125):
+    """Allow USB webcams to warm up before treating an opened device as failed."""
+    for _ in range(attempts):
+        ok,frame=capture.read()
+        if ok and frame is not None: return True,frame
+        time.sleep(delay)
+    return False,None
+
+
+def macos_camera_names():
+    """Read friendly camera names from macOS without a PyObjC dependency."""
+    if sys.platform!='darwin': return []
+    try:
+        result=subprocess.run(['/usr/sbin/system_profiler','SPCameraDataType','-json'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=12)
+        devices=json.loads(result.stdout or '{}').get('SPCameraDataType',[])
+        names=[]
+        for device in devices:
+            name=device.get('_name') or device.get('spcamera_model-id') or device.get('camera_model')
+            if name: names.append(str(name))
+        return names
+    except Exception: return []
+
+
+def browser_h264_encoder():
+    """Find a bundled or system FFmpeg H.264 encoder that can actually encode."""
+    import imageio_ffmpeg
+    bundled=imageio_ffmpeg.get_ffmpeg_exe()
+    executables=[bundled]
+    system_ffmpeg=shutil.which('ffmpeg')
+    if system_ffmpeg and os.path.realpath(system_ffmpeg)!=os.path.realpath(bundled): executables.append(system_ffmpeg)
+    candidates=['libx264','h264_videotoolbox','h264_mf','libopenh264','h264_nvenc','h264_qsv']
+    for executable in executables:
+        cached=H264_ENCODER_CACHE.get(executable)
+        if cached: return cached
+        try:
+            result=subprocess.run([executable,'-hide_banner','-encoders'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=10)
+            output=result.stdout or ''
+            compiled=[name for name in candidates if re.search(r'(?m)^\s*[A-Z\.]{6}\s+'+re.escape(name)+r'\s',output)]
+            for encoder_name in compiled:
+                options=[]
+                if encoder_name=='libx264': options=['-preset','ultrafast','-tune','zerolatency']
+                elif encoder_name=='h264_videotoolbox': options=['-allow_sw','1','-realtime','1','-b:v','900k']
+                elif encoder_name=='h264_nvenc': options=['-preset','p1','-b:v','900k']
+                else: options=['-b:v','900k']
+                smoke=[executable,'-hide_banner','-loglevel','error','-f','lavfi','-i','color=c=black:s=64x64:r=1','-frames:v','1','-an','-c:v',encoder_name,*options,'-pix_fmt','yuv420p','-f','null','-']
+                try:
+                    encoded=subprocess.run(smoke,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=8)
+                    if encoded.returncode==0:
+                        selected=(executable,encoder_name,options)
+                        H264_ENCODER_CACHE[executable]=selected
+                        return selected
+                except Exception: continue
+        except Exception: continue
+    return None
+
+
+def normalize_recording_frame(cv2, frame, width, height):
+    """Return one exact-size, contiguous BGR frame for FFmpeg's rawvideo stream."""
+    import numpy as np
+    if frame is None or getattr(frame, 'size', 0) == 0: raise RuntimeError('SERVER_CAMERA_NO_VIDEO_FRAME')
+    if frame.ndim == 2: frame=cv2.cvtColor(frame,cv2.COLOR_GRAY2BGR)
+    elif frame.ndim == 3 and frame.shape[2] == 4: frame=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
+    elif frame.ndim != 3 or frame.shape[2] != 3: raise RuntimeError('SERVER_CAMERA_UNSUPPORTED_FRAME_FORMAT')
+    if frame.shape[1] != width or frame.shape[0] != height: frame=cv2.resize(frame,(width,height),interpolation=cv2.INTER_AREA)
+    frame=np.ascontiguousarray(frame,dtype=np.uint8)
+    if frame.nbytes != width*height*3: raise RuntimeError('SERVER_CAMERA_INVALID_FRAME_SIZE')
+    return frame
+
+
+def recording_worker(session_id, pc_id, camera_index, backend, state):
+    capture = encoder = None
+    partial = final_path = None
+    started = time.time()
+    frames = 0
+    try:
+        import cv2
+        selected_encoder=browser_h264_encoder()
+        if not selected_encoder: raise RuntimeError('SERVER_H264_ENCODER_UNAVAILABLE')
+        ffmpeg_exe,codec,codec_options=selected_encoder
+        capture = cv2.VideoCapture(camera_index, backend or default_camera_backend(cv2))
+        if not capture.isOpened(): raise RuntimeError('SERVER_CAMERA_NOT_AVAILABLE')
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        capture.set(cv2.CAP_PROP_FPS, 12)
+        ok, frame = read_camera_frame(capture)
+        if not ok:
+            hint='Check the server camera permission and close other apps that may be using the camera.'
+            if sys.platform=='darwin': hint='Check macOS Camera permission for the server process and close other apps using the Logitech camera.'
+            raise RuntimeError('SERVER_CAMERA_NO_VIDEO_FRAME: '+hint)
+        height, width = frame.shape[:2]
+        frame = normalize_recording_frame(cv2,frame,width,height)
+        filename = session_id+'.mp4'
+        partial = RECORDING_DIR / (session_id+'.partial.mp4')
+        final_path = RECORDING_DIR / filename
+        command=[ffmpeg_exe,'-hide_banner','-loglevel','error','-y','-f','rawvideo','-vcodec','rawvideo','-pix_fmt','bgr24','-s:v',f'{width}x{height}','-r','12','-i','-','-an','-c:v',codec,*codec_options,'-pix_fmt','yuv420p','-movflags','+faststart','-f','mp4',str(partial)]
+        encoder=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        encoder.stdin.write(frame.tobytes()); frames += 1
+        state.update(status='recording', started_at=started, file_path=str(final_path))
+        state['ready'].set()
+        recording_update(session_id,status='recording',started_at=started,file_path=str(final_path),error='')
+        while not state['stop'].is_set():
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                frame=normalize_recording_frame(cv2,frame,width,height)
+                encoder.stdin.write(frame.tobytes()); frames += 1
+            else:
+                time.sleep(.03)
+            if frames % 48 == 0 and partial.exists() and partial.stat().st_size > MAX_RECORDING_BYTES:
+                raise RuntimeError('SERVER_CAMERA_RECORDING_SIZE_LIMIT')
+        encoder.stdin.close()
+        if encoder.wait(timeout=20)!=0: raise RuntimeError('SERVER_CAMERA_VIDEO_ENCODER_FAILED')
+        encoder=None
+        capture.release(); capture = None
+        if not partial.exists() or partial.stat().st_size < 256 or frames < 1:
+            raise RuntimeError('SERVER_CAMERA_RECORDING_EMPTY')
+        partial.replace(final_path)
+        stopped = time.time()
+        size = final_path.stat().st_size
+        recording_update(session_id,status='recorded',stopped_at=stopped,duration_seconds=max(0,round(stopped-started,2)),file_path=str(final_path),content_type='video/mp4',size_bytes=size,error='')
+        state.update(status='recorded',stopped_at=stopped,duration_seconds=max(0,round(stopped-started,2)),size_bytes=size)
+    except Exception as exc:
+        if encoder is not None:
+            try:
+                if encoder.stdin and not encoder.stdin.closed: encoder.stdin.close()
+                encoder.wait(timeout=5)
+            except Exception:
+                try: encoder.kill()
+                except Exception: pass
+        if capture is not None:
+            try: capture.release()
+            except Exception: pass
+        if partial and partial.exists():
+            try: partial.unlink()
+            except OSError: pass
+        if final_path and final_path.exists():
+            try: final_path.unlink()
+            except OSError: pass
+        error = str(exc)[:240] or 'SERVER_CAMERA_RECORDING_FAILED'
+        stopped = time.time()
+        state['error']=error
+        state['ready'].set()
+        try: recording_update(session_id,status='failed',stopped_at=stopped,duration_seconds=max(0,round(stopped-started,2)),error=error)
+        except Exception as db_exc: print('Could not save recording failure status for %s: %s' % (session_id,str(db_exc)),flush=True)
+        state.update(status='failed',stopped_at=stopped,error=error)
+        print('Recording failed for coin session %s: %s' % (session_id,error),flush=True)
+    finally:
+        state['ready'].set()
+        state['finished'].set()
+        with RECORDING_LOCK:
+            if ACTIVE_RECORDINGS.get(session_id) is state:
+                ACTIVE_RECORDINGS.pop(session_id,None)
+
+
+def start_coin_recording(session_id, pc_id, db=None):
+    settings = recording_settings()
+    now = time.time()
+    status = 'starting' if settings['enabled'] else 'disabled'
+    if db is not None:
+        db.execute('INSERT OR REPLACE INTO recordings(id,coin_session_id,pc_id,status,camera_index,camera_backend,started_at) VALUES (?,?,?,?,?,?,?)',
+                   (session_id,session_id,pc_id,status,settings['camera_index'],settings['camera_backend'],now if settings['enabled'] else None))
+    else:
+        with connect() as recording_db:
+            recording_db.execute('INSERT OR REPLACE INTO recordings(id,coin_session_id,pc_id,status,camera_index,camera_backend,started_at) VALUES (?,?,?,?,?,?,?)',
+                                 (session_id,session_id,pc_id,status,settings['camera_index'],settings['camera_backend'],now if settings['enabled'] else None))
+    if not settings['enabled']:
+        return {'status':'disabled'}
+    state = {'status':'starting','stop':threading.Event(),'finished':threading.Event(),'ready':threading.Event(),'started_at':now}
+    with RECORDING_LOCK:
+        ACTIVE_RECORDINGS[session_id] = state
+    thread = threading.Thread(target=recording_worker,args=(session_id,pc_id,settings['camera_index'],settings['camera_backend'],state),daemon=True,name='PisoNetCoinRecording-'+session_id[:8])
+    state['thread'] = thread
+    thread.start()
+    state['ready'].wait(timeout=4)
+    return {'status':state.get('status','starting')}
+
+
+def stop_coin_recording(session_id, final_state='completed'):
+    with RECORDING_LOCK:
+        state = ACTIVE_RECORDINGS.get(session_id)
+        if state is None: return
+        state['stop'].set()
+    thread = state.get('thread')
+    if thread and thread is not threading.current_thread(): thread.join(timeout=8)
+    if state.get('finished') and state['finished'].is_set():
+        with RECORDING_LOCK: ACTIVE_RECORDINGS.pop(session_id,None)
+
+
+def prune_recordings():
+    try:
+        settings=recording_settings(); cutoff=time.time()-settings['retention_days']*86400
+        with LOCK,connect() as db:
+            rows=db.execute("SELECT id,file_path FROM recordings WHERE COALESCE(stopped_at,started_at,0)<? AND status<>'recording'",(cutoff,)).fetchall()
+            for row in rows:
+                target=Path(row['file_path'] or '')
+                if target.is_file() and target.resolve().parent==RECORDING_DIR.resolve():
+                    try: target.unlink()
+                    except OSError: continue
+                db.execute('DELETE FROM recordings WHERE id=?',(row['id'],))
+    except Exception as exc: print('Recording retention cleanup warning:',str(exc),flush=True)
+
+
+def recover_recordings():
+    """Close metadata for a recorder interrupted by a server restart."""
+    now=time.time()
+    try:
+        with LOCK,connect() as db:
+            rows=db.execute("SELECT id,started_at,file_path FROM recordings WHERE status IN ('starting','recording')").fetchall()
+            for row in rows:
+                candidate=Path(row['file_path'] or (RECORDING_DIR/(row['id']+'.mp4'))).resolve()
+                if candidate.parent==RECORDING_DIR.resolve() and candidate.is_file() and candidate.stat().st_size>=256:
+                    db.execute("UPDATE recordings SET status='recorded',stopped_at=?,duration_seconds=?,file_path=?,content_type='video/mp4',size_bytes=?,error='' WHERE id=?",
+                               (now,max(0,round(now-float(row['started_at'] or now),2)),str(candidate),candidate.stat().st_size,row['id']))
+                else:
+                    db.execute("UPDATE recordings SET status='failed',stopped_at=?,error='SERVER_RESTARTED_DURING_RECORDING' WHERE id=?",(now,row['id']))
+        for partial in RECORDING_DIR.glob('*.partial.mp4'):
+            try: partial.unlink()
+            except OSError: pass
+    except Exception as exc: print('Recording restart recovery warning:',str(exc),flush=True)
 
 
 def github_ssl_context():
@@ -236,6 +512,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS pcs(id TEXT PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, last_seen REAL, online INTEGER NOT NULL DEFAULT 0, device_uuid TEXT, archived INTEGER NOT NULL DEFAULT 0, admin_locked INTEGER NOT NULL DEFAULT 0, session_bonus_seconds INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS rate_rules(denomination_centavos INTEGER PRIMARY KEY, seconds INTEGER NOT NULL CHECK(seconds >= 0), points INTEGER NOT NULL DEFAULT 0 CHECK(points >= 0));
         CREATE TABLE IF NOT EXISTS coin_sessions(id TEXT PRIMARY KEY, pc_id TEXT NOT NULL REFERENCES pcs(id), status TEXT NOT NULL, amount_centavos INTEGER NOT NULL DEFAULT 0, started_at REAL NOT NULL, last_coin_at REAL, finalized_at REAL, transaction_id TEXT UNIQUE, error TEXT NOT NULL DEFAULT '', player_id INTEGER REFERENCES player_accounts(id));
+        CREATE TABLE IF NOT EXISTS recordings(id TEXT PRIMARY KEY, coin_session_id TEXT NOT NULL UNIQUE REFERENCES coin_sessions(id) ON DELETE CASCADE, pc_id TEXT NOT NULL REFERENCES pcs(id), status TEXT NOT NULL, camera_index INTEGER NOT NULL DEFAULT 0, camera_backend INTEGER NOT NULL DEFAULT 0, started_at REAL, stopped_at REAL, duration_seconds REAL NOT NULL DEFAULT 0, file_path TEXT NOT NULL DEFAULT '', content_type TEXT NOT NULL DEFAULT 'video/mp4', size_bytes INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS coin_batches(id INTEGER PRIMARY KEY AUTOINCREMENT, coin_session_id TEXT NOT NULL REFERENCES coin_sessions(id), denomination_centavos INTEGER NOT NULL, received_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY, coin_session_id TEXT NOT NULL UNIQUE REFERENCES coin_sessions(id), pc_id TEXT NOT NULL REFERENCES pcs(id), amount_centavos INTEGER NOT NULL, purchased_seconds INTEGER NOT NULL, created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS active_sessions(id TEXT PRIMARY KEY, transaction_id TEXT NOT NULL UNIQUE REFERENCES transactions(id), pc_id TEXT NOT NULL REFERENCES pcs(id), started_at REAL NOT NULL, expires_at REAL NOT NULL, status TEXT NOT NULL);
@@ -264,6 +541,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS workstation_commands(id INTEGER PRIMARY KEY AUTOINCREMENT, pc_id TEXT NOT NULL REFERENCES pcs(id) ON DELETE CASCADE, command TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL, expires_at REAL NOT NULL, completed_at REAL, result TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS members(rowid INTEGER PRIMARY KEY, member_id TEXT, active_pc_ip TEXT, active_pc_name TEXT, name TEXT, username TEXT, password TEXT, remaining_time TEXT, vip_rem_time TEXT, vvip_rem_time TEXT, points TEXT, vip_points TEXT, vvip_points TEXT, credit TEXT, session_id TEXT, login_status TEXT, login_pctier TEXT, status TEXT, date_inserted TEXT, last_update TEXT, nonvip_attempt TEXT, vip_attempt TEXT, vvip_attempt TEXT, nonvip_last_login TEXT, vip_last_login TEXT, vvip_last_login TEXT, nonvip_activetime_snapshot TEXT, vip_activetime_snapshot TEXT, vvip_activetime_snapshot TEXT, pctier TEXT, branchid TEXT, last_spin TEXT, referred_by TEXT);
         ''')
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('recordings_enabled','1')")
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('recordings_camera_index','0')")
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('recordings_camera_backend','0')")
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('recordings_camera_name','')")
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('recordings_retention_days','30')")
+        db.execute('CREATE INDEX IF NOT EXISTS idx_recordings_started_at ON recordings(started_at)')
+        recording_cols={r['name'] for r in db.execute('PRAGMA table_info(recordings)')}
+        if 'camera_backend' not in recording_cols: db.execute('ALTER TABLE recordings ADD COLUMN camera_backend INTEGER NOT NULL DEFAULT 0')
         # Backward-compatible migration for existing PisoNet databases.
         cols = {r['name'] for r in db.execute('PRAGMA table_info(pcs)')}
         if 'device_uuid' not in cols: db.execute('ALTER TABLE pcs ADD COLUMN device_uuid TEXT')
@@ -515,8 +800,11 @@ def expire_offline_sessions(db, now, pc_id=None):
 
 
 def timer_loop():
+    last_recording_prune=0
     while True:
         now=time.time()
+        if now-last_recording_prune>=86400:
+            prune_recordings();last_recording_prune=now
         with LOCK, connect() as db:
             db.execute("UPDATE active_sessions SET status='expired' WHERE status='active' AND expires_at<=?",(now,))
             expire_offline_sessions(db,now)
@@ -527,6 +815,7 @@ def timer_loop():
                 finalize(sid,'timeout')
                 if COIN_ENGINE.session_id == sid: COIN_ENGINE.release(sid)
             except Exception: pass
+            finally: stop_coin_recording(sid,'timeout')
         time.sleep(1)
 
 
@@ -884,6 +1173,137 @@ class Handler(BaseHTTPRequestHandler):
                 rows=db.execute(f'SELECT rowid,{select_columns},CASE WHEN COALESCE(password,\'\')<>\'\' THEN 1 ELSE 0 END AS has_password FROM members ORDER BY rowid').fetchall()
             visible_columns=['rowid',*[name for name in FTECH_MEMBER_COLUMNS if name!='password'],'has_password']
             return self.send_json(200,{'count':len(rows),'columns':visible_columns,'members':[dict(row) for row in rows]})
+        if path=='/api/v2/recordings/settings':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            return self.send_json(200,recording_settings())
+        if path=='/api/v2/recordings':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            query=parse_qs(urlparse(self.path).query)
+            try:
+                from_text=query.get('from',[''])[0];to_text=query.get('to',[''])[0]
+                from_ts=time.mktime(time.strptime(from_text,'%Y-%m-%d')) if from_text else time.time()-30*86400
+                to_ts=time.mktime(time.strptime(to_text,'%Y-%m-%d'))+86400 if to_text else time.time()+1
+                if to_ts<=from_ts or to_ts-from_ts>30*86400+1: return self.send_json(400,{'error':'RECORDING_DATE_RANGE_LIMIT_30_DAYS'})
+            except (ValueError,OverflowError): return self.send_json(400,{'error':'INVALID_RECORDING_DATE_RANGE'})
+            search=query.get('q',[''])[0].strip()[:120];status=query.get('status',['all'])[0].strip().lower()
+            clauses=['r.started_at>=?','r.started_at<?'];args=[from_ts,to_ts]
+            if status not in ('','all'):
+                clauses.append('r.status=?');args.append(status)
+            if search:
+                clauses.append('(p.name LIKE ? OR p.id LIKE ? OR r.coin_session_id LIKE ? OR COALESCE(pa.username,\'\') LIKE ? OR COALESCE(t.id,\'\') LIKE ?)')
+                value='%'+search+'%';args.extend([value,value,value,value,value])
+            where=' AND '.join(clauses)
+            with connect() as db:
+                rows=db.execute('''SELECT r.id,r.coin_session_id,r.pc_id,p.name AS pc_name,r.status,r.camera_index,r.camera_backend,r.started_at,r.stopped_at,r.duration_seconds,r.content_type,r.size_bytes,r.error,
+                    c.status AS session_status,c.amount_centavos,t.id AS transaction_id,pa.username
+                    FROM recordings r JOIN pcs p ON p.id=r.pc_id JOIN coin_sessions c ON c.id=r.coin_session_id
+                    LEFT JOIN transactions t ON t.coin_session_id=c.id LEFT JOIN player_accounts pa ON pa.id=c.player_id
+                    WHERE '''+where+' ORDER BY r.started_at DESC LIMIT 1000',args).fetchall()
+                coin_rows=[]
+                if rows:
+                    ids=[r['coin_session_id'] for r in rows]
+                    for offset in range(0,len(ids),800):
+                        chunk=ids[offset:offset+800]
+                        placeholders=','.join('?' for _ in chunk)
+                        coin_rows.extend(db.execute('SELECT coin_session_id,denomination_centavos,COUNT(*) AS quantity FROM coin_batches WHERE coin_session_id IN ('+placeholders+') GROUP BY coin_session_id,denomination_centavos ORDER BY denomination_centavos',chunk).fetchall())
+            coin_map={}
+            for coin in coin_rows:
+                coin_map.setdefault(coin['coin_session_id'],[]).append('₱%g × %s' % (coin['denomination_centavos']/100,coin['quantity']))
+            items=[dict(row,coin_breakdown=', '.join(coin_map.get(row['coin_session_id'],[]))) for row in rows]
+            return self.send_json(200,{'count':len(items),'recorded_count':sum(1 for r in items if r['status']=='recorded'),'failed_count':sum(1 for r in items if r['status']=='failed'),'session_count':len({r['coin_session_id'] for r in items}), 'from':from_text,'to':to_text,'recordings':items})
+        if path.startswith('/api/v2/recordings/') and path.endswith('/video'):
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            recording_id=path.split('/')[-2]
+            with connect() as db: row=db.execute('SELECT file_path,content_type FROM recordings WHERE id=? AND status=\'recorded\'',(recording_id,)).fetchone()
+            if not row: return self.send_json(404,{'error':'RECORDING_NOT_FOUND'})
+            target=Path(row['file_path']).resolve()
+            if target.parent!=RECORDING_DIR.resolve() or not target.is_file(): return self.send_json(404,{'error':'RECORDING_FILE_NOT_FOUND'})
+            payload=target.read_bytes();origin=self.headers.get('Origin','')
+            self.send_response(200);self.send_header('Content-Type',row['content_type'] or 'video/mp4');self.send_header('Content-Length',str(len(payload)));self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Disposition','inline; filename="'+target.name+'"')
+            if origin in {'tauri://localhost','http://tauri.localhost','https://tauri.localhost','http://localhost:'+str(PORT),'http://127.0.0.1:'+str(PORT)}: self.send_header('Access-Control-Allow-Origin',origin)
+            self.end_headers();self.wfile.write(payload);return
+        if path=='/api/v2/recordings/cameras':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            saved=recording_settings()
+            if ACTIVE_RECORDINGS:
+                return self.send_json(200,{'cameras':[],'camera_index':saved['camera_index'],'camera_backend':saved['camera_backend'],'busy':True,'enumeration_mode':'recording-in-progress'})
+            try:
+                import cv2
+                cameras=[]
+                enumeration_warning=''
+                friendly_names=macos_camera_names()
+                try:
+                    from cv2_enumerate_cameras import enumerate_cameras
+                    for item in enumerate_cameras():
+                        try:
+                            index=int(item.index);backend=int(item.backend)
+                            backend_name=str(cv2.videoio_registry.getBackendName(backend))
+                            cap=cv2.VideoCapture(index,backend)
+                            opened=cap.isOpened()
+                            ok,frame=read_camera_frame(cap,attempts=5,delay=.08) if opened else (False,None)
+                            cap.release()
+                            name=str(getattr(item,'name','') or (friendly_names[index] if index<len(friendly_names) else 'Camera '+str(index)))
+                            cameras.append({'index':index,'backend':backend,'backend_name':backend_name,'name':name,'available':bool(ok and frame is not None)})
+                        except Exception as exc:
+                            enumeration_warning=str(exc)[:160]
+                except Exception as exc:
+                    # This optional package has failed at runtime on some camera
+                    # backends. Always retain OpenCV index probing as a fallback.
+                    enumeration_warning=str(exc)[:160]
+                if not cameras or not any(camera['available'] for camera in cameras):
+                    backend=default_camera_backend(cv2)
+                    backend_candidates=[backend]
+                    if getattr(cv2,'CAP_ANY',None) is not None and cv2.CAP_ANY not in backend_candidates:
+                        backend_candidates.append(cv2.CAP_ANY)
+                    seen={(camera['index'],camera['backend']) for camera in cameras}
+                    for candidate_backend in backend_candidates:
+                        try: backend_name=cv2.videoio_registry.getBackendName(candidate_backend)
+                        except Exception: backend_name='OpenCV'
+                        for index in range(10):
+                            if (index,int(candidate_backend)) in seen: continue
+                            cap=None
+                            try:
+                                cap=cv2.VideoCapture(index,candidate_backend)
+                                opened=cap.isOpened()
+                                ok,frame=read_camera_frame(cap,attempts=5,delay=.08) if opened else (False,None)
+                                if opened:
+                                    name=friendly_names[index] if index<len(friendly_names) else 'Camera '+str(index)
+                                    cameras.append({'index':index,'backend':int(candidate_backend),'backend_name':backend_name,'name':name,'available':bool(ok and frame is not None)})
+                                    seen.add((index,int(candidate_backend)))
+                            except Exception as exc: enumeration_warning=str(exc)[:160]
+                            finally:
+                                if cap is not None:
+                                    try: cap.release()
+                                    except Exception: pass
+                        if any(camera['available'] for camera in cameras): break
+                cameras.sort(key=lambda item:(item['name'].casefold(),item['backend_name'],item['index']))
+                return self.send_json(200,{'cameras':cameras,'camera_index':saved['camera_index'],'camera_backend':saved['camera_backend'],'busy':False,'enumeration_mode':'opencv-probe-fallback' if enumeration_warning or not cameras else 'named','warning':enumeration_warning})
+            except ImportError as exc: return self.send_json(503,{'error':'OPENCV_NOT_INSTALLED','detail':str(exc)[:180]})
+            except Exception as exc: return self.send_json(500,{'error':'CAMERA_DETECTION_FAILED','detail':str(exc)[:180]})
+        if path=='/api/v2/recordings/camera-check':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            if ACTIVE_RECORDINGS: return self.send_json(409,{'error':'CAMERA_BUSY_WITH_ACTIVE_COIN_SESSION'})
+            cfg=recording_settings()
+            try:
+                query=parse_qs(urlparse(self.path).query)
+                requested=query.get('camera_index',[''])[0]
+                if requested!='': cfg['camera_index']=max(0,min(65535,int(requested)))
+                requested_backend=query.get('camera_backend',[''])[0]
+                if requested_backend!='': cfg['camera_backend']=max(0,min(65535,int(requested_backend)))
+                import cv2
+                backend=cfg['camera_backend'] or default_camera_backend(cv2)
+                cap=cv2.VideoCapture(cfg['camera_index'],backend)
+                if not cap.isOpened(): cap.release();return self.send_json(200,{'available':False,'camera_index':cfg['camera_index'],'error':'SERVER_CAMERA_NOT_AVAILABLE'})
+                ok,frame=read_camera_frame(cap);width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH));height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT));fps=float(cap.get(cv2.CAP_PROP_FPS) or 0);cap.release()
+                if not ok or frame is None:
+                    detail='No video frame received after camera warm-up. Check camera permission and close apps using this camera.'
+                    if sys.platform=='darwin': detail='No video frame received after warm-up. Allow Camera access for the server process in macOS Privacy & Security, then close other apps using the Logitech camera.'
+                    return self.send_json(200,{'available':False,'camera_index':cfg['camera_index'],'camera_backend':backend,'error':'SERVER_CAMERA_NO_VIDEO_FRAME','detail':detail})
+                encoder=browser_h264_encoder()
+                if not encoder: return self.send_json(200,{'available':False,'camera_index':cfg['camera_index'],'camera_backend':backend,'width':width,'height':height,'fps':fps,'error':'SERVER_H264_ENCODER_UNAVAILABLE'})
+                return self.send_json(200,{'available':True,'camera_index':cfg['camera_index'],'camera_backend':backend,'width':width,'height':height,'fps':fps,'encoder':'H.264 ('+encoder[1]+')','error':''})
+            except ImportError: return self.send_json(200,{'available':False,'camera_index':cfg['camera_index'],'error':'OPENCV_NOT_INSTALLED'})
+            except Exception as exc: return self.send_json(200,{'available':False,'camera_index':cfg['camera_index'],'error':str(exc)[:200]})
         if path=='/api/v2/spectate/frame':
             if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             pcid=parse_qs(urlparse(self.path).query).get('pc_id',[''])[0]
@@ -1051,7 +1471,7 @@ class Handler(BaseHTTPRequestHandler):
                 total=db.execute('SELECT COUNT(*) n FROM pcs WHERE archived=0').fetchone()['n']
                 online=db.execute('SELECT COUNT(*) n FROM pcs WHERE archived=0 AND last_seen>?',(time.time()-15,)).fetchone()['n']
                 sales=db.execute('SELECT COALESCE(SUM(amount_centavos),0) n FROM transactions WHERE created_at>=?',(start,)).fetchone()['n']
-                active=db.execute("SELECT COUNT(*) n FROM active_sessions WHERE status='active' AND expires_at>?",(time.time(),)).fetchone()['n']
+                active=db.execute("SELECT COUNT(DISTINCT a.pc_id) n FROM active_sessions a JOIN pcs p ON p.id=a.pc_id WHERE a.status='active' AND a.expires_at>? AND p.archived=0",(time.time(),)).fetchone()['n']
                 recent=[dict(r) for r in db.execute('SELECT l.at,l.pc_id,COALESCE(p.name,l.hostname) AS pc_name,l.hostname,l.event,l.outcome,l.details FROM connection_logs l LEFT JOIN pcs p ON p.id=l.pc_id ORDER BY l.at DESC LIMIT 6')]
                 denom=[dict(r) for r in db.execute('SELECT b.denomination_centavos,COUNT(*) AS coin_count,COALESCE(SUM(b.denomination_centavos),0) AS total_centavos FROM coin_batches b JOIN coin_sessions c ON c.id=b.coin_session_id JOIN transactions t ON t.coin_session_id=c.id WHERE t.created_at>=? GROUP BY b.denomination_centavos ORDER BY b.denomination_centavos',(start,))]
                 return self.send_json(200,{'workstations':total,'online':online,'sales_centavos':sales,'active_sessions':active,'recent_activity':recent,'today_by_denomination':denom})
@@ -1352,6 +1772,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(201,{'ok':True,'id':build_id,'version':version,'filename':filename,'package_type':package_type,'sha256':digest,'size_bytes':len(raw)})
         try: data=self.body()
         except Exception: return self.send_json(400,{'error':'INVALID_JSON'})
+        if path=='/api/v2/recordings/settings':
+            if not self.admin(): return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
+            try:
+                enabled=data.get('enabled')
+                camera_index=int(data.get('camera_index',0));camera_backend_value=int(data.get('camera_backend',0));camera_name=str(data.get('camera_name','') or '').strip()[:160];retention_days=int(data.get('retention_days',30))
+                if not isinstance(enabled,bool) or not 0<=camera_index<=65535 or not 0<=camera_backend_value<=65535 or not 1<=retention_days<=3650: raise ValueError()
+            except (TypeError,ValueError): return self.send_json(400,{'error':'INVALID_RECORDING_SETTINGS'})
+            with LOCK,connect() as db:
+                db.execute("INSERT INTO settings(key,value) VALUES ('recordings_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",('1' if enabled else '0',))
+                db.execute("INSERT INTO settings(key,value) VALUES ('recordings_camera_index',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(camera_index),))
+                db.execute("INSERT INTO settings(key,value) VALUES ('recordings_camera_backend',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(camera_backend_value),))
+                db.execute("INSERT INTO settings(key,value) VALUES ('recordings_camera_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(camera_name,))
+                db.execute("INSERT INTO settings(key,value) VALUES ('recordings_retention_days',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(retention_days),))
+                audit(db,'admin','recordings_settings_updated',{'enabled':enabled,'camera_index':camera_index,'camera_backend':camera_backend_value,'camera_name':camera_name,'retention_days':retention_days})
+            prune_recordings()
+            return self.send_json(200,{'ok':True,'enabled':enabled,'camera_index':camera_index,'camera_backend':camera_backend_value,'camera_name':camera_name,'retention_days':retention_days})
         if path=='/api/v2/members/import-ftech':
             if not self.admin():return self.send_json(401,{'error':'ADMIN_LOGIN_REQUIRED'})
             try:
@@ -2118,6 +2554,7 @@ class Handler(BaseHTTPRequestHandler):
                 except SignalError as e:
                     db.execute("UPDATE coin_sessions SET status='cancelled',finalized_at=? WHERE id=?",(time.time(),sid))
                     return self.send_json(409,{'error':str(e)})
+                start_coin_recording(sid,pc['id'],db)
                 write_coin_event('slot_opened','success',pc['id'],pc['name'],sid)
                 return self.send_json(201,{'session_id':sid,'status':'inserting','inactivity_seconds':INACTIVITY_SECONDS,'max_seconds':MAX_INSERT_SECONDS,'coin_input_mode':'serial' if COIN_HARDWARE.port else 'simulator','coin_hardware_connected':COIN_HARDWARE.connected})
             if path.startswith('/api/coin-sessions/') and path.endswith('/coin'):
@@ -2142,7 +2579,7 @@ class Handler(BaseHTTPRequestHandler):
                 if COIN_ENGINE.high or COIN_ENGINE.last_fall is not None or COIN_ENGINE.widths:
                     return self.send_json(409,{'error':'SIMULATOR_TRAIN_IN_PROGRESS','engine':COIN_ENGINE.status()})
                 try:
-                    base=max(time.monotonic()*1000,(COIN_ENGINE.last_ms or 0)+1)
+                    base=max(coin_engine_timestamp_ms(),(COIN_ENGINE.last_ms or 0)+1)
                     for index in range(count):
                         rise=base+index*(PULSE_WIDTH_MS+80)
                         COIN_ENGINE.edge(True,rise)
@@ -2165,7 +2602,7 @@ class Handler(BaseHTTPRequestHandler):
                 deadline=min((row['last_coin_at'] or row['started_at'])+INACTIVITY_SECONDS,row['started_at']+MAX_INSERT_SECONDS)
                 if time.time() >= deadline: return self.send_json(409,{'error':'COIN_SESSION_DEADLINE_REACHED'})
                 try:
-                    decoded=COIN_ENGINE.poll(time.monotonic()*1000)
+                    decoded=COIN_ENGINE.poll(coin_engine_timestamp_ms())
                     row=db.execute('SELECT * FROM coin_sessions WHERE id=?',(sid,)).fetchone()
                     return self.send_json(200,{'decoded':decoded,'session':session_view(row) if row else None,'engine':COIN_ENGINE.status()})
                 except SignalError as e: return self.send_json(409,{'error':str(e)})
@@ -2183,7 +2620,7 @@ class Handler(BaseHTTPRequestHandler):
                 level=data.get('high')
                 if not isinstance(level,bool): return self.send_json(400,{'error':'BOOLEAN_HIGH_REQUIRED'})
                 try:
-                    now_ms=time.monotonic()*1000
+                    now_ms=coin_engine_timestamp_ms()
                     edge=COIN_ENGINE.edge(level,now_ms)
                     decoded=COIN_ENGINE.poll(now_ms)
                     row=db.execute('SELECT * FROM coin_sessions WHERE id=?',(sid,)).fetchone()
@@ -2220,6 +2657,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(409,{'error':'COIN_SESSION_HAS_CREDIT','amount_centavos':row['amount_centavos']})
                 pc_name=db.execute('SELECT name FROM pcs WHERE id=?',(pc['id'],)).fetchone()
                 write_coin_event('insertion_ended','cancelled',pc['id'],pc_name['name'] if pc_name else pc['id'],sid)
+                stop_coin_recording(sid,'cancelled')
                 return self.send_json(200,{'ok':True,'status':'cancelled','session_id':sid})
             if path.startswith('/api/coin-sessions/') and path.endswith('/done'):
                 pc=self.client(db)
@@ -2238,19 +2676,22 @@ class Handler(BaseHTTPRequestHandler):
                 # inter-pulse gap has elapsed. Do not finalize (and release)
                 # while that train is still being assembled.
                 if COIN_ENGINE.session_id == sid:
-                    COIN_ENGINE.poll(time.monotonic()*1000)
+                    COIN_ENGINE.poll(coin_engine_timestamp_ms())
                     engine_state=COIN_ENGINE.status()
                     if engine_state['coin_line_high'] or engine_state['pulse_train_open']:
                         return self.send_json(409,{'error':'COIN_PULSE_IN_PROGRESS','engine':engine_state})
                 result=finalize(sid,'done')
                 if COIN_ENGINE.session_id == sid: COIN_ENGINE.release(sid)
+                stop_coin_recording(sid,'done')
                 return self.send_json(200,result)
             except ValueError as e:
+                stop_coin_recording(sid,'done_failed')
                 with connect() as log_db:
                     pc_name=log_db.execute('SELECT p.id,p.name FROM coin_sessions c JOIN pcs p ON p.id=c.pc_id WHERE c.id=?',(sid,)).fetchone()
                     if pc_name: write_coin_event('credit_failed','failed',pc_name['id'],pc_name['name'],sid,details=str(e))
                 return self.send_json(409,{'error':str(e)})
             except Exception as e:
+                stop_coin_recording(sid,'done_failed')
                 with connect() as log_db:
                     pc_name=log_db.execute('SELECT p.id,p.name FROM coin_sessions c JOIN pcs p ON p.id=c.pc_id WHERE c.id=?',(sid,)).fetchone()
                     if pc_name: write_coin_event('credit_failed','failed',pc_name['id'],pc_name['name'],sid,details=str(e))
@@ -2429,7 +2870,7 @@ def restore_engine_reservation():
 
 
 if __name__=='__main__':
-    init_db(); restore_engine_reservation(); COIN_HARDWARE.start(); threading.Thread(target=timer_loop,daemon=True).start(); threading.Thread(target=discovery_loop,daemon=True).start(); threading.Thread(target=telegram_worker,daemon=True).start()
+    init_db(); recover_recordings(); prune_recordings(); restore_engine_reservation(); COIN_HARDWARE.start(); threading.Thread(target=timer_loop,daemon=True).start(); threading.Thread(target=discovery_loop,daemon=True).start(); threading.Thread(target=telegram_worker,daemon=True).start()
     print(f'PisoNet server listening on http://{HOST}:{PORT} (LAN discovery UDP 3211)')
     if COIN_HARDWARE.port:
         print(f'Coin slot serial input configured on {COIN_HARDWARE.port} ({COIN_HARDWARE.input_line}); hardware status: {COIN_HARDWARE.status()}')

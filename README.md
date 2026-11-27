@@ -3,7 +3,7 @@
 Public update channel for the PisoNet Windows server.
 
 - Branch: `release/server`
-- Server build: `0.48`
+- Server build: `0.49`
 - Files are listed with SHA-256 checksums in `manifest.json`.
 
 ## OTA behavior
@@ -28,3 +28,6 @@ Build `0.47` adds the FTECH members table schema and a members-only backup impor
 
 
 Build `0.48` adds Overall Sales, Per PC Sales, and Per Member Sales reports with date, workstation, member, and coin denomination filters. Reports include recorded coin insertions; the other sales source checkboxes remain unavailable until those sources are stored by the server.
+
+
+Build `0.49` publishes the proposal-based live Admin UI wired to the current server APIs, including Overview, Workstations, Members, Transactions, Sales reports, Recordings, and management pages. Sales reports include Overall Sales, Per PC Sales, and Per Member Sales.

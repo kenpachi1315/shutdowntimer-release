@@ -102,4 +102,5 @@ class CoinSignalEngine:
     @_synchronized
     def status(self):
         return {"owner":self.owner,"session_id":self.session_id,"healthy":self.healthy,"inhibited":self.inhibited,
-                "coin_line_high":self.high,"pending_pulses":len(self.widths),"pulse_train_open":self.last_fall is not None or self.high}
+                "coin_line_high":self.high,"pending_pulses":len(self.widths),"pulse_train_open":self.last_fall is not None or self.high,
+                "last_ms":self.last_ms}

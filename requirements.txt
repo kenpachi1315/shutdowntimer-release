@@ -1,0 +1,6 @@
+# Optional physical serial coin-slot interface (required when PISONET_COIN_PORT is configured).
+pyserial>=3.5,<4
+pywin32>=306; sys_platform == "win32"
+# Server-side coin-slot camera recording (no UI/media components required).
+opencv-python-headless>=4.10,<6
+imageio-ffmpeg>=0.6,<1
