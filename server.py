@@ -11,7 +11,7 @@ from serial_coin_adapter import SerialCoinAdapter
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '2.0.0-dev3'
-SERVER_BUILD = '0.47'
+SERVER_BUILD = '0.48'
 SERVER_GITHUB_REPOSITORY = 'kenpachi1315/shutdowntimer-release'
 SERVER_GITHUB_BRANCH = 'release/server'
 SERVER_GITHUB_RAW = f'https://raw.githubusercontent.com/{SERVER_GITHUB_REPOSITORY}/{SERVER_GITHUB_BRANCH}'
@@ -1118,7 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception: return self.send_json(400, {'error':'INVALID_DATE_RANGE'})
                 where = 't.created_at>=? AND t.created_at<?'; args = [start_ts,end_ts]
                 if pcid != 'all': where += ' AND t.pc_id=?'; args.append(pcid)
-                rows = [dict(r) for r in db.execute('SELECT t.id,t.pc_id,p.name AS pc_name,t.amount_centavos,t.purchased_seconds,t.created_at FROM transactions t JOIN pcs p ON p.id=t.pc_id WHERE '+where+' ORDER BY t.created_at DESC',args)]
+                rows = [dict(r) for r in db.execute('SELECT t.id,t.pc_id,p.name AS pc_name,t.amount_centavos,t.purchased_seconds,t.created_at,cs.player_id,pa.username AS player_name FROM transactions t JOIN pcs p ON p.id=t.pc_id LEFT JOIN coin_sessions cs ON cs.id=t.coin_session_id LEFT JOIN player_accounts pa ON pa.id=cs.player_id WHERE '+where+' ORDER BY t.created_at DESC',args)]
                 selected_denom=int(denomination)*100 if denomination.isdigit() else 0
                 filtered=[]
                 for r in rows:
@@ -1131,12 +1131,17 @@ class Handler(BaseHTTPRequestHandler):
                     filtered.append(r)
                 rows=filtered
                 total = sum(r['amount_centavos'] for r in rows)
-                by_pc = {}
+                by_pc = {}; by_member = {}
                 for r in rows:
                     item = by_pc.setdefault(r['pc_id'], {'pc_id':r['pc_id'],'pc_name':r['pc_name'],'transactions':0,'sales_centavos':0,'coin_counts':{}})
                     item['transactions'] += 1; item['sales_centavos'] += r['amount_centavos']
                     for denom,count in r['coin_counts'].items(): item['coin_counts'][denom]=item['coin_counts'].get(denom,0)+count
-                return self.send_json(200, {'from':start,'to':end,'total_centavos':total,'transaction_count':len(rows),'average_centavos':round(total/len(rows)) if rows else 0,'by_pc':list(by_pc.values()),'transactions':rows})
+                    if r.get('player_id') is not None:
+                        member_id=str(r['player_id'])
+                        member=by_member.setdefault(member_id, {'player_id':r['player_id'],'player_name':r.get('player_name') or 'Member #'+member_id,'transactions':0,'sales_centavos':0,'first_at':r['created_at'],'last_at':r['created_at']})
+                        member['transactions'] += 1; member['sales_centavos'] += r['amount_centavos']
+                        member['first_at'] = min(member['first_at'],r['created_at']); member['last_at'] = max(member['last_at'],r['created_at'])
+                return self.send_json(200, {'from':start,'to':end,'total_centavos':total,'transaction_count':len(rows),'average_centavos':round(total/len(rows)) if rows else 0,'by_pc':list(by_pc.values()),'by_member':sorted(by_member.values(),key=lambda item:(-item['sales_centavos'],item['player_name'].lower())),'member_total_centavos':sum(item['sales_centavos'] for item in by_member.values()),'member_transaction_count':sum(item['transactions'] for item in by_member.values()),'transactions':rows})
             if path=='/api/connection-logs':
                 if not self.admin(): return self.send_json(401,{'error':'ADMIN_AUTH_REQUIRED'})
                 rows=[]
